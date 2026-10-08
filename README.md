@@ -1,2 +1,2 @@
 # ai-sandbox
-Sandboxed env for my experiments with AI agents
+WIP: Sandboxed env for my experiments with AI agents
