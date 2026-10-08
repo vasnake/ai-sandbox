@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1
+FROM ubuntu:24.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Override with a released uv version when reproducible builds are required.
+ARG UV_VERSION=latest
+COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       bash build-essential ca-certificates curl git gnupg groff less \
+       python3 python3-dev python3-venv ripgrep unzip zip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Amazon Corretto JDKs from AWS's signed apt repository.
+RUN curl -fsSL https://apt.corretto.aws/corretto.key \
+       | gpg --dearmor -o /usr/share/keyrings/corretto-keyring.gpg \
+    && printf '%s\n' \
+       'deb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main' \
+       > /etc/apt/sources.list.d/corretto.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       java-17-amazon-corretto-jdk java-21-amazon-corretto-jdk \
+    && mkdir -p /opt/java \
+    && for version in 17 21; do \
+         javac_path="$(dpkg -L "java-${version}-amazon-corretto-jdk" \
+           | awk '/\/bin\/javac$/ {print; exit}')"; \
+         test -n "$javac_path" && test -x "$javac_path" || exit 1; \
+         ln -s "$(dirname "$(dirname "$javac_path")")" "/opt/java/$version"; \
+       done \
+    && rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2 official installer (amd64 and arm64).
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) aws_arch=x86_64 ;; \
+      arm64) aws_arch=aarch64 ;; \
+      *) echo 'Unsupported architecture for AWS CLI' >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" \
+       -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp/aws-install \
+    && /tmp/aws-install/aws/install --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin \
+    && rm -rf /tmp/aws-install /tmp/awscliv2.zip
+
+# Install Codex outside the persistent home volume; no Node/npm required.
+# CODEX_HOME here applies only to installation, not to runtime credentials.
+RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+    && CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+       CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+    && chmod -R a+rX /opt/codex \
+    && rm /tmp/install-codex.sh
+
+# Ubuntu 24.04 may already have a user with UID 1000; let useradd select a free UID.
+RUN useradd --create-home --shell /bin/bash dev \
+    && mkdir -p /workspace /home/dev/.codex /home/dev/.aws /home/dev/.local/bin \
+    && chown -R dev:dev /workspace /home/dev
+
+ENV HOME=/home/dev \
+    JAVA_HOME=/opt/java/21 \
+    JAVA17_HOME=/opt/java/17 \
+    JAVA21_HOME=/opt/java/21 \
+    AWS_PAGER=""
+ENV PATH="/opt/java/21/bin:/home/dev/.local/bin:${PATH}"
+
+# Switch all JDK tools together in an interactive shell: use-java 17 or use-java 21.
+RUN printf '%s\n' \
+    'use-java() {' \
+    '  case "$1" in 17|21) ;; *) echo "Usage: use-java 17|21" >&2; return 1 ;; esac' \
+    '  export JAVA_HOME="/opt/java/$1"' \
+    '  export PATH="$JAVA_HOME/bin:$PATH"' \
+    '  java -version' \
+    '}' >> /home/dev/.bashrc
+
+USER dev
+WORKDIR /workspace
+
+# Fail the build if any installation is unusable by the runtime user.
+RUN codex --version && uv --version && aws --version \
+    && /opt/java/17/bin/java -version && /opt/java/17/bin/javac -version \
+    && /opt/java/21/bin/java -version && /opt/java/21/bin/javac -version \
+    && python3 --version
+
+# Keep the development container running for docker exec sessions.
+CMD ["sleep", "infinity"]
