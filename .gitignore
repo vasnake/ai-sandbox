@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# my temp files
+t/
+tt/
+ttt/
+.local/
+.t/
+.tmp/

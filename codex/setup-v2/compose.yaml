@@ -1,0 +1,46 @@
+name: codex-workspace
+
+services:
+  codex:
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HOST_UID: "${DEV_UID:?Run bootstrap.sh first}"
+        HOST_GID: "${DEV_GID:?Run bootstrap.sh first}"
+
+    image: "codex-dev:ubuntu24-v2"
+    container_name: codex
+    init: true
+    restart: "no" # unless-stopped
+    working_dir: /workspace
+    mem_limit: 16g
+# Removes all Linux capabilities—special privileges such as changing network configuration, mounting filesystems, or bypassing file permissions:
+    cap_drop:
+      - ALL
+# Prevents processes from gaining privileges when executing another program, including through setuid executables or executable file capabilities:
+    security_opt:
+      - no-new-privileges:true
+
+    volumes:
+      - type: bind
+        source: "${WORKSPACE_DIR:?Run bootstrap.sh first}"
+        target: /workspace
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: volume
+        source: codex-state
+        target: /home/dev/.codex
+
+    networks:
+      - airflow-network
+
+volumes:
+  codex-state:
+
+networks:
+  airflow-network:
+    external: true
+    name: airflow-network

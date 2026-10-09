@@ -19,3 +19,7 @@
 ## 2026-10-07 setup-v1
 
 [setup-v1](./setup-v1/README.md)
+
+## 2026-10-09 setup-v2
+
+[setup-v2](./setup-v2/README.md)
