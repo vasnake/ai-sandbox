@@ -31,8 +31,8 @@ if [[ "$workspace_dir" == *"'"* || "$workspace_dir" == *$'\n'* || "$workspace_di
   exit 1
 fi
 
-docker compose version >/dev/null
-docker network inspect airflow-network >/dev/null
+docker compose version # >/dev/null
+docker network inspect airflow-network # >/dev/null
 
 # These are generated Compose inputs, not host system environment variables.
 printf "DEV_UID=%s\nDEV_GID=%s\nWORKSPACE_DIR='%s'\n" \
@@ -44,8 +44,10 @@ cd -- "$script_dir" # -- prevents the path from being interpreted as an option
 
 unset DEV_UID DEV_GID WORKSPACE_DIR # Avoid inherited shell values overriding the generated .env file.
 docker compose config # --quiet # validate the Compose file and print the effective configuration
+# exit 0 # debugging: comment out the exit to continue with the build and run steps
 
-docker compose build --pull # build the container, pulling the latest base image
+# build/rebuild
+# docker compose build --pull # build the container, pulling the latest base image
 
 # start the container in detached mode, so that it can be used for subsequent commands
 docker compose up -d
