@@ -74,3 +74,25 @@ use shift to bypass app hooks
 
 `/raw on`
 > This enables raw scrollback mode, which the official OpenAI documentation describes as making terminal selection and copying easier.
+
+# 2026-10-12 cleanup
+
+Remove unused docker images
+
+`codex-dev:ubuntu24-v2`: current image
+```sh
+docker ps -a | grep codex
+# 28be4693c741   codex-sandbox                                "bash"                   5 days ago     Exited (0) 4 days ago                  codex-sandbox-session1
+docker rm 28be4693c741
+
+docker image ls | grep codex
+codex-dev:ubuntu24-v2                                                                            d5060b257577       1.27GB          333MB   U
+codex-sandbox-debug:latest                                                                       6ebd87418b3a        2.3GB          635MB
+codex-sandbox-session1-261007v1:latest                                                           796d9c9ae09f       4.24GB         1.19GB
+codex-sandbox:latest                                                                             064944147a44       1.34GB          349MB
+
+docker image ls --format '{{.Repository}}:{{.Tag}}' | \
+  grep '^codex-sandbox' | \
+  xargs -r echo docker image rm
+
+```
