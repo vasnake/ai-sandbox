@@ -38,6 +38,7 @@ docker compose exec codex bash
 
 # in container
 pushd /workspace/gameram-dwh # data
+pushd /workspace/data # gameram-dwh
 codex
 ```
 
