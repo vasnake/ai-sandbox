@@ -104,3 +104,133 @@ docker image ls --format '{{.Repository}}:{{.Tag}}' | \
   xargs -r echo docker image rm
 
 ```
+
+# 2026-10-30 codex update
+
+codex при запуске стал показывать уведомление о доступном апдейте.
+
+Апдейт можно сделать деструктивно, уничтожив данные в контейнере (которые не в монтированных волюмах):
+```sh
+docker compose build --pull --no-cache codex
+docker compose up -d --no-deps codex
+
+# --no-cache forces Docker to rerun the installer instead of reusing the layer containing 0.162.1.
+# --pull refreshes the Ubuntu base image too.
+# up recreates the container using the rebuilt image, preserving mounted volumes
+
+# verify
+docker compose exec codex codex --version
+docker compose exec codex codex login status
+```
+
+Но можно сделать временный (пока живет контейнер) апдейт.
+TLDR; сразу дам валидное итоговое решение:
+```sh
+docker compose exec --user root codex bash -o pipefail -c '
+  curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+  && TAR_OPTIONS=--no-same-owner \
+     CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+     CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+  && chmod -R a+rX /opt/codex \
+  && rm /tmp/install-codex.sh
+'
+
+docker compose exec --user root codex bash -c '
+  rm -rfv /opt/codex/packages/standalone/releases/0.162.1-x86_64-unknown-linux-musl \
+  && rm -f /tmp/install-codex.sh
+'
+
+docker compose exec codex codex --version # codex-cli 0.166.0
+docker compose exec codex codex login status # Logged in using ChatGPT
+```
+
+Далее посмотрим на инвалидные:
+```sh
+# bad, не может поставить новый
+docker compose exec --user root codex bash -o pipefail -c '
+  curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+  && CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+    CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+  && chmod -R a+rX /opt/codex \
+  && rm /tmp/install-codex.sh
+'
+```
+Это инвалидное решение:
+```log
+setup-v2$  docker compose exec --user root codex bash -o pipefail -c '
+  curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+  && CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+    CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+  && chmod -R a+rX /opt/codex \
+  && rm /tmp/install-codex.sh
+'
+==> Updating Codex CLI from 0.162.1 to 0.166.0
+==> Detected platform: Linux (x64)
+==> Resolved version: 0.166.0
+==> Downloading Codex CLI
+==> Installing standalone package to /opt/codex/packages/standalone/releases/0.166.0-x86_64-unknown-linux-musl
+tar: bin/codex: Cannot change ownership to uid 1001, gid 1001: Operation not permitted
+...
+tar: codex-resources: Cannot change ownership to uid 1001, gid 1001: Operation not permitted
+tar: Exiting with failure status due to previous errors
+```
+
+> This comes from cap_drop: ALL in your Compose file. Root inside the container lacks CAP_CHOWN, but tar tries to restore the archive’s UID/GID (1001:1001).
+
+Валидное решение:
+```sh
+docker compose exec --user root codex bash -o pipefail -c '
+  curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+  && TAR_OPTIONS=--no-same-owner \
+     CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+     CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+  && chmod -R a+rX /opt/codex \
+  && rm /tmp/install-codex.sh
+'
+```
+Но не без проблем с зачисткой,
+TLDR; проблема в миксе владельцев: что-то под рутом, что-то под девом. it's a mess:
+```log
+setup-v2$  docker compose exec --user root codex bash -o pipefail -c '
+  curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+  && TAR_OPTIONS=--no-same-owner \
+     CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+     CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+  && chmod -R a+rX /opt/codex \
+  && rm /tmp/install-codex.sh
+'
+
+==> Updating Codex CLI from 0.162.1 to 0.166.0
+==> Detected platform: Linux (x64)
+==> Resolved version: 0.166.0
+==> Downloading Codex CLI
+==> Installing standalone package to /opt/codex/packages/standalone/releases/0.166.0-x86_64-unknown-linux-musl
+WARNING: Could not safely inspect old Codex releases; skipped remaining cleanup.
+==> /usr/local/bin is already on PATH
+==> Current terminal: codex
+==> Future terminals: open a new terminal and run: codex
+Codex CLI 0.166.0 installed successfully.
+chmod: changing permissions of '/opt/codex/packages/standalone/releases/0.162.1-x86_64-unknown-linux-musl/codex-path': Operation not permitted
+...
+chmod: changing permissions of '/opt/codex/packages/standalone/releases/0.162.1-x86_64-unknown-linux-musl/codex-package.json': Operation not permitted
+```
+
+> The update succeeded. This line confirms it: 'Codex CLI 0.166.0 installed successfully.'
+The subsequent `chmod -R` failed on files belonging to the old 0.162.1 release. Container root lacks CAP_FOWNER, which allows changing permissions on files owned by another user.
+
+Ручная зачистка:
+```sh
+docker compose exec --user root codex bash -c '
+  rm -rfv /opt/codex/packages/standalone/releases/0.162.1-x86_64-unknown-linux-musl \
+  && rm -f /tmp/install-codex.sh
+'
+```
+
+Проверка:
+```sh
+setup-v2$  docker compose exec codex codex --version
+codex-cli 0.166.0
+
+setup-v2$  docker compose exec codex codex login status
+Logged in using ChatGPT
+```
