@@ -933,3 +933,250 @@ OK, fantastic, thanks. Now I need you to prepare a description for this MR. It s
 ...
 
 # 2026-11-02 continue merge-request fixes, code review session, data/(airflow, ml)
+
+Q:
+OK, where were we?
+
+A:
+We were preparing feature/MLDE-533-gyml-train-auto for review.
+
+  • Completed the GYML training pipeline, packaged-config migration, per-index package metadata and legacy-code cleanup.
+  • Updated Airflow and ML documentation; you reviewed and committed the changes.
+  • Audited repository documentation and saved 39 issues in docs_audit.md (docs_audit.md), each with Decision and User notes fields.
+  • Prepared three Russian MR descriptions: detailed, medium and brief.
+
+  The next agreed step is to review the audit decisions and apply approved documentation fixes in small batches. No audit fixes have been applied yet.
+
+Q:
+OK, got it. Documentation fixes will have to wait. Now we should perform an audit of code that become unused after we removed and changed a lot of code in this MR. Probably we should reuse the technique from our docs audit, don't you think?
+
+A:
+Yes—the same approach fits well: audit first, record evidence, decide, then remove approved items in small batches.
+
+  I suggest keeping this audit focused on code affected by the MR and its dependencies:
+
+  • Trace references from active Airflow DAGs, job registries, CLI entry points and CI/CD scripts.
+  • Look for unused helpers, classes, parameters, configuration keys, files and dependencies.
+  • Distinguish confirmed unused code from candidates that may have external or dynamic callers.
+  • Record each candidate separately in code_audit.md, with evidence, proposed action, and blank Decision (remove / keep / investigate) and User notes fields.
+
+  Tests, archived code and research utilities need separate consideration: being unreachable from production does not make them unused.
+
+  No deletions during the audit. After your decisions, we can remove approved items and run focused checks.
+
+Q:
+Yes, agree, with one small refinement: first we should trace references from code that was deleted, and check if it still used elsewhere.
+
+A:
+Created code_audit.md (code_audit.md) with 18 topics, traced from deleted/replaced code.
+
+  Each includes evidence, remaining consumers, proposed action, and blank decision/notes fields. MR leftovers are distinguished from pre-existing unused code and possible external entry points.
+
+  Baseline checks: 18 ML tests and 6 Airflow tests passed. No code deleted; only the audit file was added.
+
+Q:
+Great job, thanks! I checked all topics, added decisions. Lets process them one-by-one, OK?
+
+A:
+I’ll read your decisions and process the first topic only. After the change and focused checks, I’ll leave it ready for your review.
+
+Topic 01 is ready: removed only generate_edge_task_group from GYML helpers (airflow/dags/batch/gyml/__init__.py), as requested.
+
+  Syntax, Black and whitespace checks passed. AST comparison confirms no other code changed. Ready for your review.
+
+Q:
+Commited. Next
+
+A:
+I’ll process topic 02: remove only generate_feature_task_group, following your note, then check the result.
+
+• Topic 02 is ready: removed only generate_feature_task_group from GYML helpers (airflow/dags/batch/gyml/__init__.py).
+
+  Syntax, Black and whitespace checks passed; AST comparison confirms no other code changed. Your edits to code_audit.md were preserved.
+
+...
+
+Q:
+Commited. It seems we done here, yes?
+
+A:
+Yes—the agreed code-cleanup pass is complete.
+
+  • Approved removals applied and committed.
+  • Retained Scala jobs and legacy path helpers marked deprecated.
+  • Topic 08 deferred; topic 13 retained for future use.
+  • Relevant checks passed.
+
+  Documentation fixes remain parked in docs_audit.md.
+
+Q:
+Perfect! Should we update our AGENTS and/or SKILLS with this audit procedure?
+
+A:
+Yes. I’d add a short rule to root AGENTS.md and put the detailed procedure in a reusable skill.
+
+  The AGENTS rule should say: start unused-code audits from deleted/replaced code, trace its dependencies, and verify remaining consumers before proposing removal.
+
+  The skill should capture:
+
+  • Compare the branch with its target from the merge base.
+  • Check source, registries, DAG wiring, CI, configs, tests and notebooks.
+  • Distinguish new leftovers, pre-existing unused code, test-only APIs and possible external callers.
+  • Record separate issues with evidence, proposed action, decision and user notes.
+  • Follow approved decisions one topic at a time; preserve retained dependencies.
+  • Run focused checks and stop for review between batches.
+
+  I’d keep specific findings and progress in code_audit.md, rather than adding them to permanent guidance. No changes yet.
+
+Q:
+Agree, with minor condition: start audit only when explicitly asked for it. OK?
+
+A:
+Yes. I’ll add the procedure to AGENTS and a reusable skill, with an explicit rule that it runs only when you request an unused-code audit.
+
+Done. Updated AGENTS.md (AGENTS.md) and added the audit-unused-code skill (.agents/skills/audit-unused-code/SKILL.md).
+
+  Both require an explicit user request; automatic skill invocation is disabled. Skill validation and whitespace checks passed.
+
+Q:
+Perfect, thanks! Now I need to discuss with you one interesting possibility: during our 'train' pipeline, we use a few config sources, like 'ml/configs/', 'ml/data/pyspark_job/configs/actual/' and nodes, edges lists in py code of the dag. I have
+  an idea that can help us to maintain all that configs in sync: what if we create a one meta-config, from which we could generate all other configs using some py script? But I don't want just merge all configs into one and then split it back. I
+  want something more sofisticated, like keep in meta-config only shareable, common parts. How can we achieve that, what do you think?
+
+A:
+I’ll compare the current training, PySpark and DAG configs to identify which values they share and which belong to a specific stage. Then I’ll suggest a design for that common layer, without changing files.
+
+Yes. I’d introduce a small graph contract that describes what the pipeline stages agree on, while keeping their individual settings in their existing configs.
+
+  The useful distinction is between a shared fact and a stage-specific decision. For example:
+```
+   Shared contract                          Keep in the stage’s own config
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Node types and ID columns                Source queries and extraction windows
+  ───────────────────────────────────────  ───────────────────────────────────────────
+   Edge dataset names and endpoints         Strict/soft filtering thresholds
+  ───────────────────────────────────────  ───────────────────────────────────────────
+   Forward and reverse graph relations      Losses, sampling and optimizer settings
+  ───────────────────────────────────────  ───────────────────────────────────────────
+   Output attribute names and types         Model dimensions and feature embeddings
+  ───────────────────────────────────────  ───────────────────────────────────────────
+   Dataset save IDs and path conventions    Spark resources, EC2 settings and logging
+```
+  For user_follow_user, preparation currently describes the source columns and saved columns, while the model config separately describes follows, is_followed_by, their endpoints and their shared dataset folder. That relationship is a good
+  candidate for the contract.
+
+  An illustrative fragment could look like this:
+```yml
+  nodes:
+    user:
+      id_column: id
+    game:
+      id_column: id
+
+  edges:
+    user_follow_user:
+      from:
+        node: user
+        output_column: account_id
+      to:
+        node: user
+        output_column: receiver_id
+      relations:
+        forward: follows
+        reverse: is_followed_by
+      attributes:
+        edge_time:
+          dtype: float
+          default: 0.0
+
+  datasets:
+    nodes_save_id: common
+    edges_save_id: edges_v0
+```
+
+  The preparation config would still explain how to obtain that dataset: read account_subscriptions, map subscriber_id and channel_id, attach timestamps and apply filters. The training config would still explain how to use its relations: losses,
+  sampling, exclusions and model parameters.
+
+  A Python generator would combine these inputs and produce the existing consumer formats:
+```
+  Shared graph contract + stage-specific configuration
+                           ↓
+                        generator
+                           ↓
+    PySpark YAML + model graph YAML + Airflow task metadata
+```
+  This gives the generator three useful responsibilities:
+
+  1. Derive repeated information. Generate DAG node/edge lists, graph folders and endpoint columns, reverse relation definitions, and shared attribute descriptions.
+
+  2. Validate relationships. Reject unknown node types, missing edge datasets, invalid relation references, or training targets that do not exist. Validate only the relevant relationships: a model can deliberately consume fewer datasets than
+     preparation produces.
+
+  3. Protect ownership. Stage-specific configs should not silently override generated contract fields. Conflicts should fail with a clear message.
+
+  I’d generate the Airflow metadata before deployment, as a regular Python module. DAG parsing would continue to use local Python data, preserving your decision to avoid reading S3 or package ZIPs to construct tasks.
+
+  For maintainability, I’d initially commit the generated files alongside their inputs. Developers run the generator after changing inputs; CI runs a --check mode that fails if generated outputs are stale. That fits the current packaging process,
+  which includes files through git ls-files, and makes the resulting changes reviewable.
+
+  There is one separate concern: execution parameters. index_id and run_dth belong to a particular run, rather than the static graph contract. Their paths should eventually be derived from one run context and passed consistently to preparation and
+  training. Today those values are not forwarded to training, so introducing generation alone would not resolve that mismatch.
+
+  I’d start with node identities, edge datasets, relation mappings and generated DAG lists. Once that works, we can extend the contract to shared feature declarations and path construction where it removes actual duplication. That keeps the first
+  version small and avoids building another configuration framework.
+
+Q:
+
+I like it, we should try implement this. A few refinements first: about index_id and run_dth, developer should define them before starting a new train pipeline, so it should not to be a problem. About our goal, if I understand you design
+  correctly: we should prepare meta-config and stage configs, according to a contract, and after running our script in 'generate' mode we should get stage configs in form as we see it now, ready to deploy. Based on that we could easily create
+  tests based on our current configs, cool. And I think the good root dir for this script and it's in/out should be 'ml/meta-config' dir. Am I missing something?
+
+A:
+Yes, that matches the design: the contract, meta-config and stage-specific inputs produce complete configs in the formats our consumers already expect. The consumers should not need to know how those configs were generated.
+
+  Defining index_id and run_dth before generation simplifies things. They can belong to a named training profile, and the generator can use them to produce matching preparation, training and output paths.
+
+  ml/meta-config/ is a good location. A possible structure:
+```
+  ml/meta-config/
+  ├── generate.py
+  ├── profiles/
+  │   └── MLDE-533.yaml       # shared graph definition, IDs, date/hour
+  ├── stages/
+  │   ├── preparation.yaml   # sources, extraction, filters
+  │   └── training.yaml      # model, losses, sampling, deployment
+  ├── generated/
+  │   └── MLDE-533/
+  │       ├── configs/       # current training-config structure
+  │       ├── data-configs/  # nodes.yaml, edges.yaml
+  │       └── dag_config.py  # task selection and pipeline parameters
+  └── tests/
+```
+  A few details are worth settling in the implementation:
+
+  • Output placement: generated files can live here, but packaging and DAG deployment must place them at the locations existing consumers expect. We should make that mapping explicit.
+  • Ownership: each setting has one authoritative input. If stage inputs try to redefine a shared contract field, generation should report a conflict.
+  • Interpolation: preserve expressions such as ${oc.env:NUM_THREADS,4} in generated YAML. Resolve only the values needed for generation, rather than capturing the developer’s environment.
+  • Explicit mappings: relation names and reverse relations should be declared, not guessed from dataset names.
+  • Validation: fail before writing outputs when references or required settings are invalid; make generation deterministic and provide a --check mode.
+
+  Your proposed tests are particularly useful. We can begin with one existing configuration as the reference and verify that generation reproduces its parsed values, paths and DAG task selection. YAML formatting need not match byte-for-byte.
+
+  For the first implementation, I’d reproduce the current configuration without changing its behavior. That will establish whether the shared contract is sufficient before we generalize it to other training profiles.
+
+Q:
+Absolutely. The problem of packaging and deploiment we will solve after preparing and testing a good-enough version of this generator. For now it will be enough just to document all limitations and requirements. OK, can you create that root
+  directory and add a file with our design into it? Make sure that design contain enough information for developers who will be implementing it.
+
+A:
+I’ll create ml/meta-config/ and add a design document covering the inputs, contract, generation rules, validation, reference tests and deferred packaging work. It will be detailed enough to guide implementation without changing the current
+  pipeline.
+
+The design document is drafted. It covers field ownership, reference-test criteria, interpolation preservation and the separate preparation/model edge selections. It also makes clear that generated files will stay isolated from the current
+  pipeline until packaging and deployment integration are designed.
+
+Created ml/meta-config/DESIGN.md (ml/meta-config/DESIGN.md).
+
+  It covers input ownership, output formats, proposed CLI, generation and validation rules, reference tests, limitations and deferred deployment requirements.
+
+  Links and Markdown checks passed. No generator or pipeline changes yet.
