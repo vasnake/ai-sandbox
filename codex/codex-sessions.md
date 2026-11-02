@@ -336,7 +336,7 @@ Yes—updated accordingly.
 
 Q:
 While I'm reviewing changes, I want you to have this little piece of information: current value of metadata in airflow variable is:
-```
+```py
 GYML_GNN_USER_INDEX_META: {
     "MLDE-479-nbopen": {
       "split": "treatment",
@@ -347,7 +347,8 @@ GYML_GNN_USER_INDEX_META: {
       "new": true
     }
   }
-```. Also, take a note: later we need to remove this 'new' attribute, because there only one (new) option left. It's all new from now on.
+```
+. Also, take a note: later we need to remove this 'new' attribute, because there only one (new) option left. It's all new from now on.
 
 A:
 • Noted for the metadata migration:
@@ -379,7 +380,7 @@ A:
 • Yes. Task selection belongs with each index’s package version, because different packages may define different nodes and edges.
 
   For example:
-```
+```py
   GYML_GNN_USER_INDEX_META = {
       "MLDE-468-new": {
           "split": "control",
@@ -489,5 +490,446 @@ Right. We should treat this as an evidence-based edit of the existing documentat
 
   The first deliverable should be that audit and proposed edits, with no file changes.
 
-TODO:
-file-by-file, scope-by-scope: dags, spark jobs, ml scripts, ...
+# 2026-10-31 continue interrupted session
+
+Q:
+OK, where were we?
+
+A:
+We paused before the documentation audit for feature/MLDE-533-gyml-train-auto.
+
+  You had approved and committed:
+
+  • CI/CD artifact paths using v<version>-dev/.
+  • Packaged configs for the remaining ML consumers.
+  • Python index metadata with mandatory package versions.
+  • Per-index task configuration for nodes and edges.
+
+  You rolled back the documentation rewrite. Our agreed next step is to audit the current docs without editing files and show:
+
+  • Incorrect or unverifiable claims, with code/CI evidence and proposed corrections.
+  • Missing documentation for changes implemented in this MR.
+  • Accurate existing details to preserve, especially parameters and input/output paths.
+
+  We’ll apply small batches only after your approval. We also need to mark gyml_gnn_train_pipeline_v2 deprecated and unsupported.
+
+Q:
+Yes, exactly. Before we proceed with our plan, I think we should delete deprecated dag 'gyml_gnn_train_pipeline_v2', not just mark it. And another problem: in ml/ package there is pyspark jobs class for inferense, 'InferencePySparkJob', and its
+wrapper link it to job names 'inference' and 'inference_v2', and I think we should check, why it still use 'is_new' flag after our decision that we keep only 'new' version of gyml tasks/jobs? And we should check what variants of inference is
+actual and what deprecated now. I described two tasks we should attend to right now, one at a time. Do you need more details?
+
+A:
+Deleted airflow/dags/batch/gyml/gyml_gnn_train_data_v2.py. No executable references remain; documentation references are left for the planned audit.
+
+  Checks passed: syntax, whitespace, and serialization of the inference, test, and validation DAGs. Training DAG import is blocked by the existing local SSH-provider/Paramiko incompatibility (DSSKey).
+
+  Only the deprecated DAG file changed. Nothing deployed; ready for your review before the inference investigation.
+
+Q:
+OK, thanks. Commited. Next
+
+A:
+I’ll trace the inference job names through the runner, their callers, and the is_new branches to identify the active and legacy variants. I’ll show you the findings and proposed cleanup before changing code.
+
+Yes — is_new is now a leftover compatibility switch. Removing the legacy Airflow DAGs did not remove the legacy ML runner entries.
+
+  It controls two things:
+
+  • Config parsing: False selects IPSJobConfig; True selects IV2PSJobConfig, which additionally accepts the packaged nodes/edges filenames. See job.py (ml/inference/pyspark_job/job.py:53).
+  • Input paths: False reads the old Scala-produced nodes/edges layout; True reads filtered edges and transformed nodes under the current data-job layout. See data.py (ml/inference/pyspark_job/data.py:106).
+
+  The available variants are:
+```
+   Runner job name            Purpose                                                     Current repository usage
+  ━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   inference                  Combined graph preparation and embeddings, legacy layout    No current DAG caller found
+  ─────────────────────────  ──────────────────────────────────────────────────────────  ─────────────────────────────────────────────
+   inference_dataset          Graph preparation, legacy layout                            No current DAG caller found
+  ─────────────────────────  ──────────────────────────────────────────────────────────  ─────────────────────────────────────────────
+   inference_embeddings       Embeddings, legacy configuration                            No current DAG caller found
+  ─────────────────────────  ──────────────────────────────────────────────────────────  ─────────────────────────────────────────────
+   inference_v2               Combined preparation and embeddings, current layout         Registered, but no current DAG caller found
+  ─────────────────────────  ──────────────────────────────────────────────────────────  ─────────────────────────────────────────────
+   inference_dataset_v2       Graph preparation, current layout                           Used by the regular inference DAG
+  ─────────────────────────  ──────────────────────────────────────────────────────────  ─────────────────────────────────────────────
+   inference_embeddings_v2    Embeddings from the prepared checkpoint                     Used by the regular inference DAG
+```
+  These are six runner entries backed by three classes—not six implementations. The factories choose their behavior through is_new.
+
+  There is also historical inference after training, through inference_app → historical_inference.Inference. That is a separate, active PyTorch workflow and should remain.
+
+  I suggest this cleanup:
+
+  1. Remove the three legacy runner entries and their factories/unused Airflow enum members.
+  2. Remove is_new from the jobs and data wrappers, retaining the current config/path behavior.
+  3. Keep the active _v2 names for now, avoiding an unnecessary caller migration.
+  4. Review the combined inference_v2 separately: it uses the current layout, so it is not inherently legacy, although no repository DAG calls it.
+
+  One caution: IPSJobConfig cannot simply be deleted—it currently supplies shared behavior inherited by IV2PSJobConfig. Graph-builder tests also use it through a mock.
+
+  Factory/config-routing smoke checks passed for all six entries. No Spark jobs or external services ran, and no files changed.
+
+Q:
+I agree. And I think we should delete 'inference_v2' chain also. As they say: the best code is code that do not exists.
+
+A:
+The cleanup is in place. The runner now exposes only the two split PySpark inference jobs, and their code uses the current config and input paths directly.
+
+  All 12 focused ML checks passed, including packaged-config loading, input-path selection, and the existing Spark graph-builder tests. The six Airflow helper checks passed too. I’m finishing the caller serialization and syntax checks before
+  handing this back for review.
+
+Ready for review.
+
+  • Removed the three legacy routes and combined inference_v2 route, including InferencePySparkJob.
+  • Removed is_new and legacy input-path branches.
+  • Kept inference_dataset_v2 and inference_embeddings_v2, using the current config/layout directly.
+  • Retained the shared config base. Historical inference after training is unchanged.
+
+  Validation passed: 12 ML tests, six Airflow checks, inference DAG serialization, job-name contracts, syntax and Black.
+
+  Documentation references are queued for the agreed audit. Nothing deployed.
+
+Q:
+Looks good, but I don't understand this test: 'test_split_jobs_use_packaged_graph_configs'. Explain please
+
+A:
+It checks the connection between the runner’s job name and the config loader. It runs twice:
+```
+   Job name                   Expected class
+  ━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   inference_dataset_v2       InferenceDatasetPySparkJob
+  ─────────────────────────  ───────────────────────────────
+   inference_embeddings_v2    InferenceEmbeddingsPySparkJob
+```
+  For each case, it:
+
+  1. Creates the job through PySparkRunner, exercising the actual registry.
+  2. Calls build_job_config() with nodes.yaml, edges.yaml, an external job-config path, date and index ID.
+  3. Mocks external YAML reads, so no S3 access occurs.
+  4. Lets the real loader read the bundled nodes/edges YAML.
+  5. Checks that the result is IV2PSJobConfig and contains the bundled saveId values: common and edges_v0.
+
+  Its main purpose is to catch a wiring regression: both remaining job names must construct jobs that use the current config loader without needing is_new=True.
+
+  It does not run Spark, build graphs or apply a model.
+
+  The name is ambiguous—“graph configs” means the nodes/edges preparation configs here, not the saved model’s graph definition. A clearer name would be test_split_job_runner_uses_v2_config.
+
+Q:
+OK, got it, thanks. I think we should rename test to 'test_inference_stages_runner_uses_v2_config'. Am I wrong?
+
+A:
+That name is clearer. I’ll rename it to test_inference_stages_runner_uses_v2_config.
+
+Q:
+Perfect! Commited. Now we can get back to 'update documentation' task. Let me reiterate: in this merge-request we changed 'airflow' and 'ml' components. So, to keep work feasible, we should find all documentation for 'airflow' module and check
+  if it contains text blocks describing removed components. After my approval for delete, we can actually delete deprecated text block. Probably we will need to ajust text around of linked to it. Than we should repeat this process for 'ml'
+  component. After that, we should add documentation for components we added in this MR, for 'airflow' and 'ml' separately. After that we should check that existing documentation for existing components is true, as contain no lies, using CI/CD and
+  code as source of truth. Is my plan agree with you?
+
+A:
+Yes, agreed. We’ll proceed in this order:
+
+  1. Airflow removals audit: find all documentation within airflow/, identify blocks describing removed components, and show you their locations, code evidence, and any surrounding text or links that need adjustment.
+  2. Apply approved Airflow deletions.
+  3. Repeat for ml/.
+  4. Document additions from this MR, separately for Airflow and ML.
+  5. Verify the remaining documentation against code and CI/CD, proposing corrections for inaccurate or unverifiable claims.
+
+  We’ll preserve accurate details and existing structure, and make no documentation changes before your approval of each batch.
+
+Q:
+Yes, wonderful. Begin
+
+A:
+The Airflow removals audit is complete. No files changed. I found relevant text in two of the six Markdown documents under airflow/.
+
+  In GYML README (airflow/dags/batch/gyml/README.md), I propose:
+```
+   Location                                                                         Proposed action                                                                                      Evidence
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Section 1 (airflow/dags/batch/gyml/README.md:8): gyml_gnn_train_pipeline         Delete its DAG-specific introduction, graph and invocation instructions.                             gyml_gnn_train_data.py was deleted in this MR.
+  ───────────────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────
+   Section 2 (airflow/dags/batch/gyml/README.md:51): gyml_gnn_train_pipeline_v2     Delete its DAG-specific description, graph and use_inference_data instructions.                      gyml_gnn_train_data_v2.py has now been deleted.
+  ───────────────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────
+   Section 3 (airflow/dags/batch/gyml/README.md:118): gyml_gnn_user_index_update    Delete its legacy workflow, entry points and old nodes/edges layout.                                 Its DAG file and legacy runner routes were deleted.
+  ───────────────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────
+   Old training procedure (airflow/dags/batch/gyml/README.md:285)                   Delete the procedure involving the placeholder train_model and separately invoked upload_history.    Those instructions describe the removed training DAGs.
+```
+  These deletions should preserve reusable information:
+
+  • Retain the packaged-config description and detailed raw/filtered/transformed paths currently inside section 2, under a shared section.
+  • Retain one copy of the training artifact paths; remove duplicate copies.
+  • Move the still-current graph-checkpoint and diagnostic-output paths from section 3 into the active inference section. They remain defined in inference config (ml/inference/pyspark_job/config.py:282).
+  • Preserve shared entry-point references where the components remain active.
+
+  Associated adjustments:
+
+  • Remove the deleted DAG from the opening index and adjust section numbering.
+  • Replace the references to its path descriptions at line 224 (airflow/dags/batch/gyml/README.md:224) and line 282 (airflow/dags/batch/gyml/README.md:282) with references to the retained shared section.
+  • Leave the vague final TODO pending clarification—it is not evidence that specific code was removed.
+
+  In the main Airflow README (airflow/README.md:181):
+
+  • The example command invokes deleted gyml_gnn_user_index_update. Replace that name with the existing gyml_gnn_user_index_update_v2.
+  • The captured context output (airflow/README.md:196) also contains the old name. I recommend preserving it with a historical-example label. Its purpose is explaining Airflow context, not documenting that DAG.
+
+  The other four documents contain no references to components removed in this MR. Other accuracy corrections remain for the later audit phase.
+
+  Do you approve this deletion-and-preservation batch?
+
+Q:
+Yes, I approve. Try to remove as little as possible, preserving valid information.
+
+A:
+Applied the approved batch to GYML README (airflow/dags/batch/gyml/README.md) and Airflow README (airflow/README.md).
+
+  Removed obsolete DAG instructions while retaining shared configs, detailed data paths, artifact parameters, and diagnostic paths. Updated cross-references and the example command; preserved the historical context output verbatim with a label.
+
+  Preservation, links, anchors, code fences, and whitespace checks passed. Only those two documentation files changed. Ready for your review.
+
+Q:
+Still checking, but already I can see that we could reuse information from 'gyml_gnn_train_pipeline_v2' section later, when adding documentation for our new train dag. It will be useful because the new dag is just simplified
+  'gyml_gnn_train_pipeline_v2'. We should save that part of the doc in some temp space, to have the ability to use it later.
+
+A:
+I’ll save the previous gyml_gnn_train_pipeline_v2 section in a local temporary file, with a note that it’s reference material for documenting the new training DAG.
+
+Saved the complete section in temporary reference material (/tmp/gyml-train-doc-reference-bz4b_wvs/gyml_gnn_train_pipeline_v2.md), including its source commit.
+
+  We’ll reuse applicable details when documenting gyml_gnn_train, checking them against its current code. Repository files are unchanged by this save.
+
+Q:
+Perfect! Commited. Next
+
+A:
+I’ll now audit documentation under ml/ for references to components removed in this MR. I’ll propose the deletions and any related adjustments for your approval, without changing files.
+
+The ML removals audit is complete. No files changed. Relevant edits are limited to two of the seven tracked Markdown files.
+```
+   Location                                                              Proposed change                                                                          Code evidence
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Config-resource job list (ml/data/pyspark_job/configs/README.md:5)    Remove only inference_v2 from the list.                                                  It is no longer registered in pyspark_runner.py (ml/pyspark_runner.py:186).
+  ────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────
+   Model-config consumers (ml/README.md:389)                             Replace pyspark_runner.py inference with the two retained stage names. Preserve the      The inference route was removed; dataset and embeddings stages remain.
+                                                                         config explanation.
+  ────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────
+   Legacy input paths (ml/README.md:287)                                 Replace only the two old nodes/edges paths with the current transformed-node and         load_dataset (ml/inference/pyspark_job/data.py:96) now reads only the current layout.
+                                                                         filtered-edge templates, or links to their existing detailed documentation.              Preserve the segment path.
+ ```
+  Two associated examples need adjustment:
+
+  • Local Spark command (ml/README.md:160).
+  • Distributed Spark command (ml/README.md:265).
+
+  Both omit the runner job name and packaged config filenames. I propose preserving their Spark/runtime options and changing only the application arguments to the retained dataset stage:
+
+  pyspark_runner.py inference_dataset_v2 nodes.yaml edges.yaml <job_config> "<date_hour>" <index_id>
+
+  The surrounding text should identify this as dataset preparation, with embeddings calculated separately through inference_embeddings_v2.
+
+  We should preserve:
+
+  • The inference section itself, model/config paths, segment, checkpoint and embeddings output paths.
+  • Docker, Conda and test instructions.
+  • Historical inference after training—it remains active.
+  • Archive documentation and build_test_segment_legacy documentation; those components still exist.
+
+  Other accuracy corrections belong to the later verification pass.
+
+  Do you approve these targeted removals and associated adjustments?
+
+Q:
+Yes, looks good, proceed
+
+A:
+Applied the approved edits to ML README (ml/README.md) and config-resource README (ml/data/pyspark_job/configs/README.md).
+
+  Removed obsolete job references, adjusted both command examples to the dataset stage, and updated the legacy input paths. Spark options, model/output paths, and surrounding instructions were preserved.
+
+  Command arguments, path builders, links, Markdown, and whitespace checks passed. Only those two documentation files changed. Ready for review.
+
+Q:
+Good, commited. Next
+
+A:
+Next is documenting the Airflow components added in this MR. I’ll compare their code with the current docs and propose additions for your approval before editing. We’ll handle ML additions separately afterward.
+
+Next is Airflow documentation additions. I propose:
+
+  1. Add a gyml_gnn_train section to GYML README (airflow/dags/batch/gyml/README.md), covering:
+      • Manual launch parameters: run_dth and selected stages.
+      • Pipeline: data collection on EMR → training and historical inference on EC2 → Redis index loading.
+      • Configuration locations: package versions, index ID, Docker image and EC2/SSH settings.
+      • Inputs and outputs, reusing the preserved path descriptions.
+      • Operational limits: one active run, 23-hour DAG timeout, prerequisites when skipping stages.
+
+  2. Explicitly explain that run_dth and index_id are not passed to training: training paths come from the selected ML package. Data collection and training also have separate package selectors.
+
+  3. Correct the training-stage README (airflow/dags/batch/gyml/train_tasks/scripts/README.md): actual SSH connection and tmux names, retry settings, and the last 200 log lines at DEBUG. Explain that the wrapper currently runs both training and
+     historical inference.
+
+  Existing valid detail will stay. The saved training documentation will supply reusable material, checked against current code.
+
+  No files changed yet; this is the proposed scope for approval.
+
+Q:
+Looks good, I approve. Try to use most of the saved text from the old dag.
+
+A:
+Updated both READMEs:
+
+  • GYML DAGs (airflow/dags/batch/gyml/README.md): added training documentation, reusing applicable saved text and preserving shared paths and artifact details verbatim.
+  • Training stage (airflow/dags/batch/gyml/train_tasks/scripts/README.md): corrected settings, retries, logging and wrapper behavior.
+
+  Checked claims against code, local links, anchors and whitespace. Documentation changes only; ready for review.
+
+Q:
+Perfect! Commited. Next
+
+A:
+Next is the ML documentation additions. I’ll compare the MR changes with the existing docs and propose a focused update for approval, preserving valid details.
+
+The ML docs already cover most CLI commands, packaged YAML loading and dev/release S3 paths. I propose these focused additions:
+```
+   Location                                 Proposed update
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ML README (ml/README.md), GNN section    Link to the new Airflow training documentation; explain PreTrain → Train → PostTrain and the separate historical Inference → PostInference workflow.
+  ───────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Same, configuration section              Clarify that BasicTrainConfig loads only packaged configs/config.yaml, preserves interpolation and exposes resolved Python values.
+  ───────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Same, historical inference               Explain that standalone execution requires local datasets and the model already present; it does not run PreTrain. Describe local outputs and uploads controlled by deploy.is_enable.
+  ───────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Same, CI/CD section                      Explain that code and YAML configs travel together in the ZIP, packaging includes tracked files, and dev deployment permits overwriting its version prefix.
+  ───────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Same, package selection instructions     Replace the blanket ML_PACKAGE_VERSION guidance with the actual GYML selectors: per-index metadata for regular inference and separate package settings for training.
+```
+  The package-config and data-job READMEs already describe the migrated consumers, so I’d preserve those without repeating their content.
+
+  I’ll also correct the adjacent claim that inference.is_enable starts historical inference: execution is selected by the entry point instead.
+
+  No files changed.
+
+Q:
+Agree. Try to be concise but retain vital information: data in/out paths, configuration and parameters source and meaning.
+
+A:
+I’ll make the focused ML README updates, keeping the input/output paths and explaining where configuration and execution parameters come from.
+
+
+The README now has a compact table of local and S3 paths for inputs, model files and historical embeddings. It also distinguishes training from standalone historical inference and explains the package selectors. Existing commands and PySpark path
+  details are preserved.
+
+Updated ML README (ml/README.md) with concise workflow descriptions, input/output paths, configuration behavior and package selection.
+
+  Preserved existing commands and PySpark details. Checked claims against code/CI, configuration keys, links and whitespace.
+
+  Documentation only; ready for review.
+
+Q:
+Perfect! Commited. What next?
+
+A:
+Next is verifying the remaining existing documentation against code and CI, starting with Airflow, then ML.
+
+  For each component, I’ll:
+
+  • Identify inaccurate claims about behavior, parameters, paths and deployment.
+  • Show the evidence and propose minimal corrections.
+  • Wait for your approval before editing.
+
+  The documentation for removed components and the new functionality is now covered.
+
+Q:
+Lets make it a total: check all project documentation, OK?
+
+A:
+I’ll inventory the documentation and check it against code and CI, then present findings before making edits. I’m treating “all project documentation” as the airflow/ and ml/ components we’ve been updating.
+
+? Should this audit cover all documentation in airflow/ and ml/, or the entire monorepo?
+
+  • Airflow and ML
+  • Entire monorepo
+
+The inventory contains 13 tracked Markdown files across Airflow and ML, including contributor guidance and archived documentation. I’ve found some likely mismatches around disabled metrics, test-mode support and CLI examples. I’m tracing those to
+  the implementation before proposing corrections.
+
+Q:
+entire repo, please
+
+A:
+The audit now covers all 35 tracked documentation files across the repository. No files changed.
+
+  These are the confirmed corrections I’d propose:
+```
+   Area                                                                 Findings
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Root README (README.md:272)                                          LoadUserIndexJob takes five arguments, including a ClickHouse secret ID; the docs describe six with login/password. The basic-index job runs through gyml_basic_index, not the
+                                                                        deleted GYML DAG.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Root deployment instructions (README.md:975)                         Still reference removed DAGs, Airflow-variable index metadata and the removed inference_embeddings runner. Historical examples should be clearly labelled; current procedures
+                                                                        need updating.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Root YAML example (README.md:646)                                    onlineTimeLimitMinutes: 15, parses as a string, whereas the Scala configuration requires an integer.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   CI/CD guidance (README.md:884)                                       Branch and deployment rules are overgeneralized. Ordinary feature-branch pushes do not create pipelines under the current root workflow; several services deploy production
+                                                                        automatically. Similar “any other commit” claims occur in service READMEs.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Airflow GYML documentation (airflow/dags/batch/gyml/README.md:24)    Metrics are documented as an active stage, but their wiring is commented out. Nodes and edges run in parallel. References to discovered config_path sets should describe
+                                                                        filenames and Python metadata.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Airflow general documentation (airflow/README.md:181)                The airflow dags test interval explanation is incorrect. With the documented hourly schedule, the supplied logical date does not equal the inferred interval start. Docker-
+                                                                        network examples also create airflow-network but connect to airflow-test-network.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Airflow contributor guidance (airflow/AGENTS.md:29)                  CI excludes external_files/*, whereas AGENTS lists dbt/external_files/*.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ML README (ml/README.md:373)                                         The inference example attributes graph-size limits to maxGamesListSize, which the current implementation does not consume. Docker examples also contain inconsistent image tags
+                                                                        and the obsolete Conda environment name gnn_pyspark; current builds use gnn.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ML data-job documentation (ml/data/pyspark_job/README.md:27)         Supported modes include test. For transforms, use_inference_data also affects test mode. basePath should be described as computed from index_id, rather than a consumed YAML
+                                                                        setting.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Seqrec documentation (ml/feed/seqrec/pyspark_job/README.md:246)      User inference is implemented, despite being described as a NotImplementedError stub. Model files contain state dicts loaded into model classes, rather than serialized model
+                                                                        objects.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ALS training README (ml-als-post-feed/train/README.md)               Output examples use feed/als-models/trained/authors; current configuration uses feed/models/als_author. The CatBoost command has a comment after a continuation backslash,
+                                                                        breaking the command.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ALS service README (ml-als-post-feed/service/README.md)              Launch commands use port 8080, curl examples use 8000. Model preparation references both app/_models and feed_service/models, while current configuration expects app/models.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Chat adapter README (chat-scoring-adapter/README.md:83)              Actual configuration keys include MaxPendingTimeSec and MaxProcessingTimeSec. RequestTimeoutSec is missing from the explanation. Proposed monitoring settings should be
+                                                                        labelled as planned: they are not implemented configuration fields.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Data-quality README (data-quality/README.md:11)                      Environment creation and activation use different prefixes. The local-run example omits required environment variables and the data_context directory. Several Conda/Docker
+                                                                        command examples also need correction.
+  ───────────────────────────────────────────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Dataset inventory (datasets.md:208)                                  Lists ColdStartSeriesGamesTop and games_series_cold_top as an active reader, although neither implementation is present. This needs historical qualification rather than an
+                                                                        unsupported claim of current execution.
+```
+ There are also five broken local links or anchors: three in the root README, one in lfg-request-event.md, and one in the LFG research documentation.
+
+  Changelogs and dated research results should remain historical records. Warehouse measurements, external deployment state and backend-confirmed conventions cannot be independently established from this repository alone; I would preserve them with
+  appropriate attribution.
+
+  Validation included a repository-wide local-link scan, source/CI tracing, YAML parsing, and an Airflow 2.10.3 interval check. No deployment or external-service calls were made.
+
+  I recommend applying these as small component-by-component batches, preserving valid paths, parameters and historical detail.
+
+Q:
+Great! Lets save your findings in the file 'docs_audit.md' in the project root. Let it be one topic for one issue, and for each topic add a placeholder for my decision, like 'fix' or 'skip', with optional notes from me. Later we can use this doc
+  as instructions for fixing docs.
+
+A:
+I’ll create docs_audit.md with one issue per topic, supporting evidence, a suggested correction, and blank decision and notes fields for you.
+
+Created docs_audit.md (docs_audit.md) with 39 separate issues. Each includes evidence, a proposed correction, and blank Decision (fix/skip) and User notes fields.
+
+  All evidence links checked. No other files changed.
+
+Q:
+OK, fantastic, thanks. Now I need you to prepare a description for this MR. It should be in three parts: detailed description, no more than a page of text; moderatly brief description, about half the size of detailed; brief description, no more
+  than five consice sentences. In Russian. Can you do that?
+
+...
+
+# 2026-11-02 continue merge-request fixes, code review session, data/(airflow, ml)
