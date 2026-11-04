@@ -385,3 +385,87 @@ Wonderful, commited. And the typo I fixed by hand, thanks.
 
 A:
 That completes the review findings: the fixes are committed, the typo is corrected, and the debug step limit remains unchanged as agreed.
+
+# 2026-11-04 add permissions, aws, terraform
+
+Q:
+Today we need to do some work in this project. It is about devops, terraform and AWS infrastructure. Take a look and tell me about main features of this project.
+
+A:
+This is the AWS infrastructure and deployment repository for Gameram’s data and analytics services. It combines Terraform, Ansible, GitLab CI/CD, and Python deployment tooling, primarily targeting us-east-1.
+
+  The main components are:
+```
+   Area                                                      Main features
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Shared Terraform infrastructure (terraform/README.md)     Separate stacks for deployment permissions, CI identities, and S3 lifecycle configuration. State lives in the gameram-terraform S3 bucket, with separate keys per stack/environment.
+  ────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   IAM and deployment access (terraform/access/README.md)    Separate Terraform plan/apply roles and CDC dev/prod roles. GitLab identities assume these roles using temporary STS credentials. The access stack itself requires bootstrap/admin
+                                                             credentials.
+  ────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ClickHouse (clickhouse/terraform/README.md)               EC2, dedicated persistent EBS storage, security groups, IAM, and S3 backup permissions. Ansible deploys ClickHouse through Docker Compose and systemd, with health checks and
+                                                             OpenTelemetry metrics sent to SigNoz. Includes snapshot recovery, native backup/restore, and migration procedures.
+  ────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   CDC (cdc/README.md)                                       PostgreSQL → Debezium/MSK Connect → Kafka → S3. Python tooling configures PostgreSQL replication, Kafka topics, connectors, and snapshot signals across develop, demo, and production.
+  ────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   MLflow (ml/terraform/mlflow/README.md)                    EC2 deployment running MLflow and PostgreSQL in containers, S3 artifact storage, persistent EBS data, daily DLM snapshots, snapshot recovery, and observability.
+  ────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ML training                                               Feed ALS (ml/terraform/feed-als/README.md) provisions a training worker and private DNS. GYML (ml/terraform/gyml-training/README.md) supports configurable training instances, with
+                                                             Ansible workflows to prepare environments, run training, and collect results.
+  ────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   S3 retention (terraform/s3/gameram-data/README.md)        Manages lifecycle rules on the existing gameram-data bucket, including dataset expiration and noncurrent-version cleanup.
+  ────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Superset (superset/README.md)                             Configuration for an existing EC2/Docker Compose deployment. IAM support exists, but there is no Superset Terraform workload stack or deployment pipeline here.
+```
+  The GitLab pipeline is organized into child pipelines for Terraform, ClickHouse, MLflow, and CDC. Terraform workflows save reviewed plans as artifacts; production applies are manual. ClickHouse and MLflow then generate Ansible inventory from
+  Terraform outputs and configure the hosts.
+
+  A few observations relevant to our upcoming work:
+
+  • It extends existing AWS infrastructure. Many stacks reuse specific subnets, security groups, key pairs, and other resources.
+  • Automation coverage varies. ClickHouse and MLflow have integrated deployment flows; training infrastructure and Superset retain manual steps.
+  • State locking is not configured in the committed backends.
+  • Some documentation trails the implementation. For example, the ClickHouse README initially lists CI/CD as future work, although its pipeline is implemented later in the same document.
+
+  This overview is based on the repository configuration; I haven’t queried live AWS resources or changed any files.
+
+Q:
+OK, good work, my thoughts exactly. I need your help in finding the correct modules for this changes: there should be existing policy 'data-ci-etl-artifacts-dev', with sid 'ListDevArtifactPrefixes' and 'WriteDevArtifacts'. For listing sid I need
+  to add prefixes '"data/ml/package", "data/ml/package/*"';
+  for writing sid I need to add resource '"arn:aws:s3:::gameram-jobs/data/ml/package/*"'.
+Can you find files where we should make changes, and show me suggested changes w/o modifying files?
+
+A:
+I’ll locate the policy and both statements, then show the proposed diff without modifying any files.
+
+The policy is managed by the terraform/data-ci-access stack. Both statements are in etl_artifacts.tf (terraform/data-ci-access/etl_artifacts.tf:1).
+
+  Suggested diff:
+``` diff
+  --- a/terraform/data-ci-access/etl_artifacts.tf
+  +++ b/terraform/data-ci-access/etl_artifacts.tf
+  @@
+         values = [
+           "tmp/data",
+           "tmp/data/*",
+  +        "data/ml/package",
+  +        "data/ml/package/*",
+         ]
+  @@
+  -    resources = ["${local.jobs_bucket_arn}/tmp/data/*"]
+  +    resources = [
+  +      "${local.jobs_bucket_arn}/tmp/data/*",
+  +      "${local.jobs_bucket_arn}/data/ml/package/*",
+  +    ]
+```
+  local.jobs_bucket_arn resolves to arn:aws:s3:::gameram-jobs, so the added resource matches your requested ARN.
+
+  I also suggest updating README.md (terraform/data-ci-access/README.md:10) to describe the expanded access:
+```
+  -- `data-ci-etl-artifacts-dev`: upload/read non-production ETL artifacts under `s3://gameram-jobs/tmp/data/...`
+  +- `data-ci-etl-artifacts-dev`: upload/read artifacts under `s3://gameram-jobs/tmp/data/...` and ML packages under `s3://gameram-jobs/data/ml/package/...`
+```
+  No changes are needed in terraform/access: it references the policy ARN but does not define these statements. No files have been modified.
+
+Q:
+OK, looks good, thanks. Make the changes
