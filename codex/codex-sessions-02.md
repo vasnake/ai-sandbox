@@ -469,3 +469,387 @@ The policy is managed by the terraform/data-ci-access stack. Both statements are
 
 Q:
 OK, looks good, thanks. Make the changes
+
+# 2026-11-05 add permisions, aws, terraform
+
+Q:
+Hi, in this session we will add missing permissions. Today I've got this error: '''User: arn:aws:sts::405263509977:assumed-role/AmazonMWAA-new-emrTest/AmazonMWAA-airflow is not authorized to perform: ec2:StartInstances on resource:
+  arn:aws:ec2:us-east-1:405263509977:instance/i-0761c6f4fa7d61e30
+  because no identity-based policy allows the ec2:StartInstances action.'''. And earlier I was working on a airflow dag, where requirements stated as: '''MWAA execution role can `ec2:StartInstances`, `ec2:StopInstances`, `ec2:DescribeInstances`,
+  and `ec2:DescribeInstanceStatus` for the target account and region. Describe permissions generally use Resource '*'.'''. I need you to check, where in current project we have set permissions for start/stop EC2 instances for MWAA role
+
+A:
+I’ll look for the MWAA execution role and any policies granting it EC2 start/stop permissions.
+
+This repository currently has no EC2 start/stop permissions configured for the MWAA role AmazonMWAA-new-emrTest. I found no declaration or policy attachment referencing that role.
+
+  The existing ec2:StartInstances / ec2:StopInstances permissions are in:
+```
+   File                                                                Purpose
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   clickhouse_access.tf (terraform/access/clickhouse_access.tf:104)    Terraform deployment access for ClickHouse
+  ──────────────────────────────────────────────────────────────────  ────────────────────────────────────────────
+   mlflow_access.tf (terraform/access/mlflow_access.tf:237)            Terraform deployment access for MLflow
+  ──────────────────────────────────────────────────────────────────  ────────────────────────────────────────────
+   superset_access.tf (terraform/access/superset_access.tf:165)        Terraform deployment access for Superset
+```
+  Those policies attach to terraform-data-deployments-apply through terraform_roles.tf (terraform/access/terraform_roles.tf:96).
+
+  The Airflow-related policy in airflow_deploy.tf (terraform/data-ci-access/airflow_deploy.tf:1) grants the data-ci-prod CI user permission to deploy files to S3. It does not manage the MWAA execution role’s runtime permissions.
+
+  So this requires adding a policy attachment for the existing MWAA execution role, rather than extending one of the existing EC2 deployment policies. The role’s current AWS policies may be managed manually or elsewhere; that cannot be determined
+  from this repository.
+
+Q:
+In this repo we have not AWS MWAA related settings, am I understand you correctly?
+
+A:
+Yes—this repository does not manage the MWAA environment or its execution role (AmazonMWAA-new-emrTest).
+
+  It does contain Airflow-related configuration: CI permissions for uploading DAGs, requirements, and startup scripts to S3. Those control deployment files, not MWAA’s runtime permissions.
+
+Q:
+OK, got it, thanks. But we have ML-related EC2 instances settings, right?
+
+A:
+Yes. There are three ML-related Terraform stacks:
+
+  • GYML training (ml/terraform/gyml-training/ec2_instance.tf) — configurable ml-gyml-training-* EC2 instances, using the existing mlTrainingRole.
+  • Feed ALS training (ml/terraform/feed-als/ec2_instance.tf) — ml-train-prod-worker, its launch template, and private DNS; its IAM role is defined in the same stack.
+  • MLflow (ml/terraform/mlflow/main.tf) — the MLflow server EC2 instance, persistent data volume, and supporting infrastructure.
+
+  These manage the instances and their own permissions. Permission for Airflow to start or stop them belongs to the MWAA execution role.
+
+Q:
+And we can use instance-id references to this instances in other terraform blocks?
+
+A:
+Yes. Within the same Terraform stack, you can reference an instance directly:
+```
+  aws_instance.ml_train_prod_worker.id
+  aws_instance.ml_train_prod_worker.arn
+```
+  GYML instances use for_each, so the reference includes the instance name:
+
+  aws_instance.gyml_training["ml-gyml-training-1"].arn
+
+  Across separate stacks, like those in this repository, direct references don’t work. You expose the IDs or ARNs through Terraform outputs, then pass them as inputs or read them through remote state.
+
+  For the MWAA permissions, we could use those ARNs to scope ec2:StartInstances and ec2:StopInstances to the intended training instances.
+
+Q:
+OK, good. Tell me, what we have to do to import existing role settings from (https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/roles/details/AmazonMWAA-new-emrTest)? With intention to add stack for AWS MWAA
+
+A:
+I’ll check the repository’s stack conventions and Terraform’s import guidance, then outline how to bring the existing role under management and extend that into an MWAA stack.
+
+Yes. I suggest creating a dedicated terraform/mwaa stack, adopting the execution role first and importing the MWAA environment in a later step.
+
+  The console link identifies the role, but I haven’t inspected its live configuration. We need an AWS inventory before writing matching Terraform.
+
+  1. Read the existing role and all its policies.
+
+     Using an authenticated AWS CLI profile:
+```
+     aws iam get-role --role-name AmazonMWAA-new-emrTest
+
+     aws iam list-attached-role-policies \
+       --role-name AmazonMWAA-new-emrTest
+
+     aws iam list-role-policies \
+       --role-name AmazonMWAA-new-emrTest
+```
+     Then retrieve each inline policy with get-role-policy, and each attached customer-managed policy’s default version with get-policy / get-policy-version. This captures the trust policy, permissions boundary, tags, session duration, and
+     permissions.
+
+ 2. Create the stack using this repository’s conventions.
+
+     Proposed structure:
+```
+     terraform/mwaa/
+       versions.tf
+       providers.tf
+       variables.tf
+       iam.tf
+       imports.tf
+       outputs.tf
+       environments/prod.tfvars
+       backends/prod.backend.hcl
+       README.md
+```
+     Use the existing gameram-terraform state bucket with a separate key such as mwaa/prod/terraform.tfstate.
+
+  3. Declare and import the role and policy resources separately.
+
+     The role import would be:
+```
+     import {
+       to = aws_iam_role.mwaa_execution
+       id = "AmazonMWAA-new-emrTest"
+     }
+```
+     Importing the role does not automatically bring every attached policy under Terraform management. We should explicitly model inline policies and managed-policy attachments. Import customer-managed policy documents only where this stack should
+     own them; AWS-managed policies remain references. Terraform IAM role documentation (https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role)
+
+     This resembles the existing import approach in GYML’s iam.tf (ml/terraform/gyml-training/iam.tf).
+
+  4. Establish an unchanged baseline, then add EC2 permissions.
+
+     Match the existing configuration until the initial plan shows imports only: zero additions, changes, or deletions. Terraform can generate initial resource configuration from import blocks, but that output requires review. Terraform import
+     guidance (https://developer.hashicorp.com/terraform/language/import/generating-configuration)
+
+     After adoption, add a separate policy granting:
+      • ec2:StartInstances and ec2:StopInstances on the intended training instance ARNs.
+      • ec2:DescribeInstances and ec2:DescribeInstanceStatus with Resource = "*", scoped to us-east-1.
+
+  5. Extend deployment access and later adopt the MWAA environment.
+
+     The shared Terraform roles need permissions for the new state prefix and MWAA IAM resources before this stack can use them. Those changes belong in terraform/access; pipeline jobs belong in terraform/.gitlab-ci.yml.
+
+     For the environment itself, first discover its actual name and settings—its name cannot safely be inferred from the role name. Then declare and import aws_mwaa_environment, referencing the adopted role’s ARN. The environment is imported by
+     name. MWAA resource documentation (https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/mwaa_environment)
+
+  My recommendation is two stages: execution role and permissions first, MWAA environment second. That gives us a reviewable baseline before managing the environment’s broader configuration. No files changed.
+
+Q:
+I started working on our plan. I created the file 'terraform/mwaa/README.md', which now works as a log of our operations. I need your help with the last paragraph in this log: can you generate commands, described there, given the info I gather already?
+
+A:
+I’ll read the log and use the details you’ve collected to generate the commands requested in its last paragraph.
+
+Your inventory contains five inline policies and three customer-managed policies. The other four attached policies are AWS-managed.
+
+  Run these commands from terraform/mwaa/pre-existing, using the same authenticated AWS profile as before.
+```sh
+  Retrieve all inline policies:
+
+  for policy_name in \
+    allowEC2Backups \
+    EC2-DescribeSnapshots \
+    mlTrainingEC2InstanceDescribe \
+    mlTrainingEC2InstanceStart \
+    mlTrainingEC2InstanceStop
+  do
+    aws iam get-role-policy \
+      --role-name AmazonMWAA-new-emrTest \
+      --policy-name "$policy_name" \
+      --output json \
+      > "iam.get-role-policy.${policy_name}.json" || break
+  done
+
+  Retrieve each customer-managed policy’s metadata and default-version document:
+
+  for policy_arn in \
+    arn:aws:iam::405263509977:policy/service-role/MWAA-Execution-Policy-09f72b1f-5fbb-4a17-887c-7e3b20f06652 \
+    arn:aws:iam::405263509977:policy/for_transient_emr_policy \
+    arn:aws:iam::405263509977:policy/GameramClickHouseAirflowSecretRead
+  do
+    policy_name="${policy_arn##*/}"
+
+    aws iam get-policy \
+      --policy-arn "$policy_arn" \
+      --output json \
+      > "iam.get-policy.${policy_name}.json" || break
+
+    policy_version=$(aws iam get-policy \
+      --policy-arn "$policy_arn" \
+      --query 'Policy.DefaultVersionId' \
+      --output text) || break
+
+    aws iam get-policy-version \
+      --policy-arn "$policy_arn" \
+      --version-id "$policy_version" \
+      --output json \
+      > "iam.get-policy-version.${policy_name}.json" || break
+  done
+```
+  These follow AWS’s documented retrieval flow: get-role-policy (https://docs.aws.amazon.com/cli/latest/reference/iam/get-role-policy.html) for inline policies, then get-policy (https://docs.aws.amazon.com/cli/latest/reference/iam/get-policy.html)
+  and get-policy-version (https://docs.aws.amazon.com/cli/latest/reference/iam/get-policy-version.html) for managed policies.
+
+  Your existing iam.get-role.json already contains the trust relationship, including both Airflow service principals and the role’s /service-role/ path.
+  Also, the inline policy names show that EC2 start/stop permissions already exist in AWS. Their documents will let us check why they don’t cover the failing instance.
+
+Q:
+OK, I'm working on it. By the way, the EC2 start/stop permissions I added by hand, using AWS web UI. Here and now we only need to import existing settings and build the terraform stack that reproduce current state of airflow role.
+
+A:
+Understood. We’ll limit this work to adopting the existing AmazonMWAA-new-emrTest role: its trust policy, inline policies, and managed-policy attachments, exactly as configured.
+
+  The target is an initial plan with imports only—zero resources added, changed, or destroyed. We won’t add permissions or import the MWAA environment in this step.
+
+Q:
+OK, I ran those commands and updated readme file. Do we have enough info?
+
+A:
+I’ll check the updated log and exported policies to see whether anything is missing for a Terraform stack that matches the role’s current configuration.
+
+• Yes—we have enough information to build the role stack. I checked the exports; they contain:
+
+  • Role name, /service-role/ path, trust policy, and session duration.
+  • All five inline policy documents.
+  • All seven managed-policy attachment ARNs.
+  • Metadata, tags, and matching default-version documents for the three customer-managed policies.
+
+  One ownership detail: for_transient_emr_policy has two attachments, so another identity also uses it. I recommend managing its attachment to MWAA while leaving the shared policy document outside this stack initially.
+
+  For completeness, explicitly confirm the role’s tags—the role export contains no Tags field:
+```sh
+  # From terraform/mwaa/pre-existing/
+  aws iam list-role-tags \
+    --role-name AmazonMWAA-new-emrTest \
+    --output json \
+    > iam.list-role-tags.json
+```
+  We can then build the configuration and import declarations. A live Terraform plan will provide the final verification that adoption produces imports only, with zero additions, changes, or deletions.
+
+Q:
+Great! I know that role have no tags now. Please, check the repo for guidelines about what tags we should add, if any
+
+A:
+I’ll check the repository guidance and existing IAM role tags for any convention that applies to the MWAA role.
+
+• I found no repository-wide tagging requirement for IAM roles. Existing conventions vary:
+
+  • Shared Terraform and CDC roles use Team = "data" via access/locals.tf (terraform/access/locals.tf:2).
+  • MLflow uses Environment, ManagedBy, Service, Team, and other workload tags.
+  • The imported GYML role retains its existing lowercase department, service, and environment tags.
+
+  The existing MWAA-related policy GameramClickHouseAirflowSecretRead has:
+```t
+  Environment = "prod"
+  Service     = "airflow"
+  Team        = "data"
+```
+  For our current import, I recommend keeping the role untagged so we preserve the agreed baseline of zero changes.
+
+  If we later standardize its tags, a reasonable set consistent with the existing Airflow policy would be:
+```t
+  tags = {
+    Environment = "prod"
+    ManagedBy   = "terraform"
+    Service     = "airflow"
+    Team        = "data"
+  }
+```
+  That is a recommendation, not an existing repository requirement. No files changed.
+
+Q:
+I agree. Please, add the list of recommended tags to the readme file, in form of TODO
+
+A:
+I’ll add a TODO with the recommended tags and note that they should be applied after the initial import.
+
+• Added the TODO to README.md (terraform/mwaa/README.md) with all four recommended tags, deferred until after the initial import.
+
+  git diff --check passed.
+
+Q:
+Thanks, commited. OK, I think we are ready to build a stack. Take into account the style and conventions of this repo and add the implementation, please. If you need to execute some commands that require AWS credentials, or some such, don't hesitate to ask me
+
+A:
+I’ll build the role-only stack from the exports, following the repository’s Terraform conventions and preserving the current permissions and tags. I’ll also check the shared deployment access needed for planning and importing it, and run the checks available locally.
+
+• The exports cover one role, five inline policies, and seven managed-policy attachments. I’ll also adopt the two policies used only by this role, while keeping for_transient_emr_policy as an attachment reference because another identity uses it.
+
+  The shared Terraform roles don’t currently have access to these resources or the proposed state prefix. I’ll document a manual import using the existing bootstrap/admin profile, following the GYML adoption pattern. CI integration can follow
+  separately.
+
+• The stack is implemented, and Terraform validation passes. I also rendered the policy documents locally with the AWS provider and compared them with your exports: the trust policy, five inline policies, two owned managed policies, existing policy
+  tags, and seven attachment ARNs match.
+
+  The remaining check is a live plan to confirm the 15 imports produce no AWS changes. That requires an authenticated profile; I haven’t connected to AWS or applied anything.
+
+• Implemented the role-only stack in terraform/mwaa (terraform/mwaa/README.md), including import declarations, backend configuration, outputs, provider lock file, and usage instructions.
+
+  Formatting, Terraform validation, and offline comparison against your exports passed. No AWS changes were applied. CI integration remains deferred.
+
+  Please run the following with your authenticated profile and share the plan output:
+```sh
+  AWS_PROFILE=aws-admin-access terraform -chdir=terraform/mwaa init \
+    -backend-config=backends/prod.backend.hcl
+
+  AWS_PROFILE=aws-admin-access terraform -chdir=terraform/mwaa plan \
+    -var-file=environments/prod.tfvars -out=prod.tfplan
+```
+  Expected: 15 imports, 0 additions, 0 changes, 0 deletions. Review that before applying.
+
+Q:
+Wonderful! I recorded commands output in file 'terraform/mwaa/exec-log.log', take a look
+
+A:
+I’ll review the execution log and check whether the plan contains only the expected imports.
+
+• The execution log (terraform/mwaa/exec-log.log) shows exactly the intended result:
+
+  15 imports, 0 additions, 0 changes, 0 deletions.
+
+  The trust policy, empty role tags, five inline policies, two owned policies, and seven attachments are preserved. The shared EMR policy is imported only as an attachment.
+
+  You can now apply the saved plan using the same AWS credentials:
+```sh
+  terraform -chdir=terraform/mwaa apply prod.tfplan
+
+#  Then confirm the baseline:
+
+  terraform -chdir=terraform/mwaa plan \
+    -var-file=environments/prod.tfvars
+```
+  Expected result: No changes.
+
+Q:
+OK, I ran commands and updatet exec-log, take a look
+
+A:
+I’ll check the updated log for the import results and the follow-up plan.
+
+• Confirmed in the updated log (terraform/mwaa/exec-log.log:675):
+
+  • Apply: 15 imported, 0 added, 0 changed, 0 destroyed.
+  • Follow-up plan: “No changes. Your infrastructure matches the configuration.”
+
+  The role adoption is complete. Terraform now manages the agreed role settings and policies, with existing permissions and tags preserved.
+
+Q:
+Cool! OK, give me a conclusion, what have we done, and what should be our next steps
+
+A:
+We’ve completed the Terraform adoption of the existing MWAA execution role AmazonMWAA-new-emrTest.
+
+  The new terraform/mwaa stack manages:
+
+  • The role, its trust relationship, path, session duration, and empty tags.
+  • Five existing inline policies, including EC2 describe/start/stop permissions.
+  • Two dedicated customer-managed policies.
+  • Seven managed-policy attachments. The shared for_transient_emr_policy document remains externally managed.
+
+  We imported 15 resources without changing AWS infrastructure or permissions. The follow-up plan reports no changes, confirming the configuration matches AWS. The README, discovery exports, and execution log document the process.
+
+  Recommended next steps:
+
+  1. Commit the stack and operation records, if you haven’t already.
+  2. Add the agreed role tags as a separate change: Environment=prod, ManagedBy=terraform, Service=airflow, and Team=data.
+  3. Integrate with shared deployment roles and GitLab CI by adding scoped IAM permissions, access to the mwaa/* state prefix, and plan/manual-apply jobs.
+  4. Consider importing the MWAA environment itself when we’re ready to manage its configuration.
+
+  We can also revisit references to training instance ARNs later, so instance replacements don’t require manually updating the role’s policies.
+
+Q:
+Good. I updated README, and I'm ready to add role tags
+
+A:
+I’ll check your README update, add the four agreed role tags, and run the local checks before you generate the AWS plan.
+
+• Added the four agreed tags to iam.tf (terraform/mwaa/iam.tf) and updated the README. Formatting, validation, and diff checks passed.
+
+  Generate a fresh plan using your existing authenticated setup:
+```sh
+  terraform -chdir=terraform/mwaa plan \
+    -var-file=environments/prod.tfvars -out=role-tags.tfplan
+```
+  Expected: 0 to add, 1 to change, 0 to destroy, changing only the role’s tags and tags_all.
+
+Q:
+Done and done. Thanks, I think this is enough for our new tf stack. We will continue working on it sometime later. You where great help, thanks again.
+
+A:
+You’re welcome! The MWAA role stack is in place, the import is verified, and the tags are added. We can pick up CI integration whenever you’re ready.
