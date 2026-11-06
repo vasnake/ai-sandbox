@@ -853,3 +853,682 @@ Done and done. Thanks, I think this is enough for our new tf stack. We will cont
 
 A:
 You’re welcome! The MWAA role stack is in place, the import is verified, and the tags are added. We can pick up CI integration whenever you’re ready.
+
+# 2026-11-06 functionality changes in data/etl jobs
+
+Q:
+Hi, in this session we will be working on a new task: update functionality of existing ETL Spark jobs, related to GYML GNN index in Redis. Are you ready?
+
+A:
+• Ready. Tell me which job or behavior we’re changing, and I’ll trace the implementation and its Airflow/configuration contracts first.
+
+Q:
+› OK, I will tell you about our goal and my plan, and then we discuss the details, OK?
+
+A:
+• Go ahead—share the goal and your plan, then we’ll work through the details.
+
+Q:
+› Goal: in the existing 'lang' field we should write the 'main' (or 'primary') user's language, not 'first' or 'last';
+  in the new 'langList' field we should write the list of all user's languages.
+  The target dataset is the GYML GNN 'index' in redis.
+
+A:
+• Understood. For the GYML GNN index in Redis:
+
+  • lang: the user’s primary language, determined by an explicit rule.
+  • langList: all the user’s languages.
+
+  Share your implementation plan, especially how we identify the primary language and handle users without language data.
+
+Q:
+› Plan
+  - Identify which jobs (gyml gnn) build the dataset to be loaded into Redis, to use as gyml 'index'.
+  - Identify a data source available to the job(s) that provides the user's “primary/main” language.
+  - Identify a data source available to the job(s) that provides a list of all the user's languages.
+  - Update the Redis index schema to add a new `langList` field.
+  - Update the job(s) code to meet the requirements: write the user's “primary/main” language to `lang` and all the user's languages to `langList`.
+
+A:
+• The plan makes sense. We should also trace every path that writes or refreshes these Redis records, so an update job cannot later replace the primary language with the old value.
+
+  While inspecting the sources, we’ll establish the primary-language rule, fallback behavior, and how langList should be serialized, deduplicated, and ordered. Before changing code, we should check the readers of lang and the Redis schema/
+  configuration to confirm compatibility.
+
+  That should give us a concrete change scope to review together.
+
+Q:
+› First, we should investigate the repo, particulary 'etl' and 'ml' components. We should find particular jobs that prepare data right before it written to redis. I know at least one such job: it used in airflow dag 'gyml_gnn_train' in the last
+  stage 'update_index'. Can you find all relevant jobs?
+
+A:
+• I’ll trace the gyml_gnn_train index-update stage, then look for other ETL and ML jobs that prepare or refresh the same Redis records.
+
+• The training load and hourly refresh both use the same Scala job and dataset builder. I also found an ad hoc configuration for that job. ML produces the embeddings upstream; the final language fields are assembled in ETL. I’m checking the
+  language source and neighboring Redis writers to confirm the scope.
+
+• Yes. Both initial loading and regular refresh use the same Scala job: com.gameram.batch.gyml.gnn.index.user.LoadUserIndexJob (etl/src/main/scala/com/gameram/batch/gyml/gnn/index/user/LoadUserIndexJob.scala:13).
+
+  It has three configuration variants:
+```
+   Execution path                 Caller                                                                                                                                     Configuration
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Initial load after training    gyml_gnn_train, stage update_index                                                                                                         gymlGnnLoadUserIndexJob_history.yaml (configs/etl/batch/
+                                                                                                                                                                             gymlGnnLoadUserIndexJob_history.yaml)
+  ─────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────
+   Hourly index refresh           DAG gyml_gnn_user_index_update_v2, defined in gyml_gnn_inference_data_v2.py (airflow/dags/batch/gyml/gyml_gnn_inference_data_v2.py:203)    gymlGnnLoadUserIndexJob_regular.yaml (configs/etl/batch/
+                                                                                                                                                                             gymlGnnLoadUserIndexJob_regular.yaml)
+  ─────────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  ────────────────────────────────────────────────────────────────────────────
+   Ad hoc execution               No Airflow caller found                                                                                                                    gymlGnnLoadUserIndexJob_adhoc.yaml (configs/etl/batch/
+                                                                                                                                                                             gymlGnnLoadUserIndexJob_adhoc.yaml)
+```
+  All three target Redis hashes with prefix gyml:{indexId}:.
+
+  The preparation immediately before Redis is:
+
+  1. UserIndexDatasetBuilder (etl/src/main/scala/com/gameram/batch/gyml/gnn/index/user/UserIndexDatasetBuilder.scala:32) loads embeddings and user attributes, joins them, and produces the complete index dataset. This is where lang is assembled and
+     where we should add langList.
+
+  2. GnnUserIndexRow (etl/src/main/scala/com/gameram/batch/gyml/gnn/index/user/model/GnnUserIndexRow.scala:25) defines the resulting row schema.
+
+  3. LoadUserIndexJob checkpoints that dataset to S3, reads it back, and passes it to the shared RedisIndexLoader (etl/src/main/scala/com/gameram/batch/redis/RedisIndexLoader.scala:32). The YAML declares which columns become Redis fields and
+     search-index fields.
+
+  In ml/, InferenceDatasetPySparkJob prepares graph data and InferenceEmbeddingsPySparkJob produces user vectors. Historical inference after training also produces vectors. These jobs supply embeddings, but do not assemble the final Redis
+  attributes. The language-field change belongs in the ETL builder and its output/configuration contracts.
+
+  Two neighboring writers target separate datasets: GymlUpdateUserBasicIndexJob uses gymlB:, and GymlNewbieIndexUpdateJob uses gymlN:. They do not refresh these GNN hashes.
+
+  One useful detail for our next step: the builder currently obtains lang through LocaleDump.getAccountLang, but LocaleDump now wraps the ClickHouse user-profile reader—the S3-locale comment there is outdated.
+
+Q:
+› Wonderful! So the first point of our plan is done. You found and I confirm that we have three jobs that prep dataset for writing to 'index': LoadUserIndexJob, GymlUpdateUserBasicIndexJob, GymlNewbieIndexUpdateJob.
+
+A:
+• Confirmed. Our scope covers all three index-preparation jobs:
+
+  • LoadUserIndexJob — GNN index (gyml:).
+  • GymlUpdateUserBasicIndexJob — basic index (gymlB:).
+  • GymlNewbieIndexUpdateJob — streaming newcomers index (gymlN:).
+
+  Next, we’ll trace the available sources for primary language and the complete language list for each job.
+
+Q:
+› Yes, totally. We have to find (for each job) the available data sources, that allow as to define user's languages.
+
+A:
+• I’ll trace the language sources available to each of the three jobs, including any fields that distinguish the primary language from the full list.
+
+• The batch jobs currently receive only one language through the user-profile adapter. The streaming job receives a language list in account-event, but its declared schema has no primary-language marker. I also found the account_languages dump,
+  joined with the language-code lookup; I’m checking which columns it preserves.
+
+• I found a usable language-list source for every job, but the primary-language contract still needs confirmation.
+```
+   Job                 Language source currently loaded                                  Full language list                                                               Primary language
+  ━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   LoadUserIndexJob    ClickHouse analytics.user_profile_snapshot, through LocaleDump    Available separately from the account_languages dump; not currently loaded by    Snapshot exposes language_code, documented as preferred language, but its
+                                                                                         this job                                                                         selection rule is outside this repository
+  ──────────────────  ────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────
+   GymlUpdateUserBa    Same ClickHouse snapshot and adapter                              Same account_languages dump; not currently loaded by this job                    Same uncertainty
+   sicIndexJob
+  ──────────────────  ────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────  ───────────────────────────────────────────────────────────────────────────────
+   GymlNewbieIndexU    Kafka account-event                                               Already receives languageCodes; also receives locales                            No primary-language field or marker in the declared event schema
+   pdateJob
+```
+  For the two batch jobs, the promising source is:
+```
+  s3://gameram-data/postgres-dump/account_languages/
+      dt=YYYY-MM-DD/hour=HH/
+```
+  The direct export reads account_languages and joins language on language_id, providing language codes alongside account-language attributes. The repository explicitly references is_main_language as the intended primary-language marker. However,
+  that reference is in comments; we should confirm the column in the actual exported schema before implementing against it. See PostgreSqlDump.scala (etl/src/main/scala/com/gameram/batch/extract/PostgreSqlDump.scala:31).
+
+  One relevant ML detail: its existing reader declares only language_id, account_id, code, and execution date/hour. It does not expose is_main_language, and prepare_account_language() currently chooses an arbitrary non-null code. We should not
+  reuse that selection logic for Redis. Schema (ml/common/__init__.py:130), selection (ml/data/pyspark_job/nodes.py:65).
+
+  For the streaming job, the list is already available in AccountEvent.languageCodes (etl/src/main/scala/com/gameram/streaming/model/KafkaEvents.scala:148). Its current parseLang() joins all codes into one comma-separated string, falling back to
+  codes extracted from locales. Thus, streaming lang currently contains a list rather than one selected language. parseLang (etl/src/main/scala/com/gameram/streaming/model/KafkaEvents.scala:183).
+
+  My recommendation is:
+
+  • Batch: derive lang from the explicitly marked primary row and langList from all account-language rows.
+  • Streaming: use languageCodes for langList; establish an explicit primary-language field in the event contract, or identify another authoritative source. Array position alone does not establish primacy.
+
+  The remaining evidence we need is the actual account_languages schema and the producer’s primary-language contract for account-event. No files changed.
+
+Q:
+› Perfect! We identified jobs and data sources in their current state. Using this information we could plan our next steps. I think, we should save this findings in some document. Lets create file 'MLDE-39-gyml-user-lang.md' in the repo root, and use it as documentation for our task.
+
+A:
+• I’ll save the findings and open contract questions in the root task document, with a proposed next-step checklist.
+• Created MLDE-39-gyml-user-lang.md (MLDE-39-gyml-user-lang.md) with the three jobs, current language sources and behavior, unresolved contracts, code references, and a next-step checklist.
+
+Q:
+› Lets dig deeper into data sources. 'user_profile_snapshot' is defined in dbt project which located under '/workspace/gameram-dwh/'. Can you see it?
+
+A:
+• I’ll check that workspace for the dbt project and the user_profile_snapshot definition.
+
+• Yes. The dbt project is accessible at /workspace/gameram-dwh/gameram_dbt/.
+
+  I found user_profile_snapshot.sql (/workspace/gameram-dwh/gameram_dbt/models/marts/analytics/user_profile/user_profile_snapshot.sql). We can trace its language-selection logic and upstream models next.
+
+Q:
+› OK, lets find out, what information about languages we can derive from teh definition of user_profile_snapshot
+
+A:
+• I’ll trace the snapshot’s language fields back through its upstream models to establish how the language is selected and whether the full list is available.
+
+• The dbt code confirms that account language selection honors is_main_language. It also shows two limits: when no language is marked primary, selection is unordered; when several are marked primary, all survive that intermediate model. I’m
+  checking how the profile handles those results and device-language fallback.
+
+• user_profile_snapshot.language_code already honors the primary-language flag, with fallback rules. It does not expose the complete language list.
+
+  The selection chain is:
+```
+  account_languages + language → account_languages_main ─┐
+                                                         ├→ user_profile_history → user_profile_snapshot
+  device_languages + language → device_languages_main ───┘
+```
+  For an account, account_languages_main (/workspace/gameram-dwh/gameram_dbt/models/intermediate/utils/account_languages_main.sql:41) behaves as follows:
+```
+   Source data                                            Selection
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Exactly one language marked is_main_language = true    That language
+  ─────────────────────────────────────────────────────  ─────────────────────────────────────────────────
+   No language marked primary                             One arbitrary row; row_number() has no ordering
+  ─────────────────────────────────────────────────────  ─────────────────────────────────────────────────
+   Several languages marked primary                       All marked rows survive the intermediate model
+```
+  The device-language model uses the same rules.
+
+  user_profile_history (/workspace/gameram-dwh/gameram_dbt/models/marts/analytics/user_profile/user_profile_history.sql:402) then chooses:
+
+  coalesce(accounts.language_code, ud.language_code)
+
+  So the account’s selected language takes precedence. If it is NULL, the model falls back to the selected device’s language. An empty account-language string does not trigger that fallback.
+
+  Finally, user_profile_snapshot (/workspace/gameram-dwh/gameram_dbt/models/marts/analytics/user_profile/user_profile_snapshot.sql:69) selects the latest recorded profile at or before the requested date/hour and excludes tombstones. It passes
+  through language_code without selecting a different language. If multiple candidates reach the history for the same account and hour, the snapshot’s ordering does not resolve that tie deterministically.
+
+  For our task, this means:
+
+  • lang: the existing batch source already provides the primary account language when exactly one valid primary is defined. We still need to agree on behavior for missing/multiple primary flags and device fallback.
+  • langList: it cannot be reconstructed from this snapshot. We need all account-language relationships from another source.
+
+  I also resolved one earlier uncertainty: the dbt model postgres_dump__account_languages (/workspace/gameram-dwh/gameram_dbt/models/intermediate/postgres_dump/postgres_dump__account_languages.sql) exports account_id, language_id, code, and
+  execution date/hour, but explicitly omits is_main_language. That export supports the full list, but cannot independently identify the primary language.
+
+  These conclusions come from SQL analysis; I haven’t queried live data or changed files.
+
+Q:
+› So, using user profile, in our batch job we can one-or-more rows with language for one unique account_id?
+
+A:
+• From user_profile_snapshot, we get at most one row per account_id for registered users. Its row_number() ... = 1 filter enforces that.
+
+  The upstream account_languages_main can produce multiple rows when several languages are marked primary. The snapshot ultimately retains one, but the chosen language is not deterministic when candidates share the same execution date/hour.
+
+  So our batch jobs receive one selected language per account—not all its languages.
+
+Q:
+› OK, I think it is good enough for our batch jobs. And it means, we don't need to do aggregation to get language, right?
+
+A:
+• Right. For registered users, user_profile_snapshot already provides at most one row per account_id, so no language aggregation is needed.
+
+  We can select account_id and language_code directly for lang. The aggregation in LocaleDump.getAccountLang is redundant for this source.
+
+  We’ll still need separate aggregation of all account-language rows to build langList.
+
+Q:
+› By the way, in GYML we working only with 'registered' users, account_id is not null. We don't have to consider records where account_id is null. In fact, we have to filter out such records.
+
+A:
+• Understood. For all three GYML index jobs, we’ll include only registered users and filter out records without a valid account_id.
+
+  For user_profile_snapshot, that means account_id > 0, since unregistered profiles use -1 rather than NULL.
+
+Q:
+› OK, we decided that for 'main' language in batch jobs we will be using user profile fields. Source of all languages is still under consideration. Now we dig deeper into Kafka account-event. This event generated by the 'back' code, which you can
+  find in '/workspace/back/' directory. Can you see it?
+
+
+• I’ll check that the backend repository is accessible and locate the account-event producer.
+
+• Yes, /workspace/back/ is accessible. I found the likely event definition: AnalyticsAccountEvent.java (/workspace/back/projects/commons-kafka/src/main/java/com/gameram/commons/kafka/event/analytics/AnalyticsAccountEvent.java).
+
+  We can trace its language fields and producer next.
+
+Q:
+› Lets find out what info we can expect from this event
+
+A:
+• I’ll trace the event definition and producer code to see how language fields are populated and whether they preserve the primary-language distinction.
+
+• I found an important detail: the producer builds languageCodes from Account.getLanguages(), which explicitly sorts primary languages first. So the event does preserve primary-language priority through list order, even though it has no separate
+  primary-language field. locales is a set and does not preserve that distinction.
+
+• The event provides all account languages, ordered with primary languages first. This resolves our earlier uncertainty about ordering.
+
+  The producer builds languageCodes through:
+```
+  Account.accountLanguages
+    → sort primary languages first
+    → extract Language.code
+    → collect into a list
+    → account-event.languageCodes
+```
+  The sorting explicitly uses isMainLanguage, and the event builder preserves that order. See Account.getLanguages() (/workspace/back/projects/back-mono/src/main/java/com/gameram/jpa/model/entity/Account.java:301) and getAccountLanguageCodes() (/
+  workspace/back/projects/back-mono/src/main/java/com/gameram/common/service/UserEventTemplateServiceImpl.java:862).
+```
+   Event information                 What we can derive
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   languageCodes                     All saved account-language codes
+  ────────────────────────────────  ──────────────────────────────────────────────────────────────────────────────────────────────────
+   First element of languageCodes    A primary language if at least one language is marked primary
+  ────────────────────────────────  ──────────────────────────────────────────────────────────────────────────────────────────────────
+   locales                           Language/country strings, such as en#US; collected into a set, so primary-language order is lost
+  ────────────────────────────────  ──────────────────────────────────────────────────────────────────────────────────────────────────
+   Explicit primary-language flag    Not included
+```
+  There are two edge cases:
+
+  • No primary flag: all languages have equal sorting priority. The first element does not prove primacy.
+  • Several primary flags: primary languages come first, but the order among them is not explicitly defined.
+
+  Also, CREATE and UPDATE populate these fields from the account’s current language collection; they are not language-only deltas. The DELETE template supplies the account ID and event type without language data.
+
+  For GymlNewbieIndexUpdateJob, this gives us a practical path: use languageCodes for langList, and its first element for lang under the producer’s primary-first rule. We still need to agree that selecting the first available language is an
+  acceptable fallback when none is marked primary—the consumer cannot distinguish that case from this payload.
+
+Q:
+› Wonderful! For streaming job we have all we need. About the fallback: yep, It is acceptable.
+
+A:
+• Confirmed for the streaming job:
+
+  • lang: first element of languageCodes, which prioritizes primary languages.
+  • langList: all values from languageCodes.
+  • If none is marked primary, the first available language is an accepted fallback.
+
+Q:
+› Considering data sources, all we need to do now - is find out what source to use for collecting all languages for each user in 'index'. Right?
+
+A:
+• Right—the remaining source decision is the full language list for the two batch jobs:
+
+   Jobs                        lang                                            langList
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   GNN and basic batch jobs    user_profile_snapshot.language_code — agreed    Still to choose
+  ──────────────────────────  ──────────────────────────────────────────────  ────────────────────────────
+   Newcomers streaming job     First languageCodes element — agreed            All languageCodes — agreed
+
+  For batch langList, the existing account_languages dump is a strong candidate. It already contains account_id and language code; its missing primary flag is irrelevant now that we use the user profile for lang.
+
+Q:
+› To be sure, lets check data repo for possible alternatives. Maybe we have better solution in existing jobs?
+
+A:
+• I’ll look for existing language readers and aggregations in the data repository, then compare the reusable options with the account_languages dump.
+
+• I found two existing implementations of full language lists, both using the same account_languages S3 dump:
+```
+   Existing job               Preparation
+  ━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Seqrec user-feature job    Groups by account and uses collect_set(code) → languageCodes. users.py (ml/feed/seqrec/pyspark_job/users.py:417)
+  ─────────────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   GYML test-segment job      Filters null accounts/codes, then uses sort_array(collect_set(code)). segments.py (ml/data/pyspark_job/segments.py:804)
+```
+  The GYML test-segment implementation is the closest template for our langList: distinct language codes with deterministic ordering. We would additionally enforce registered users with account_id > 0.
+
+  There is also a ClickHouse alternative supported by existing ETL infrastructure. ClickhouseUtils.readSnapshot (etl/src/main/scala/com/gameram/batch/clickhouse/ClickhouseUtils.scala:25) already reads parameterized CDC snapshots;
+  ConnectionGoalReaderImpl uses that pattern. We could introduce a shared language reader that reads postgres_snapshot__account_languages, joins postgres_snapshot__language, and aggregates codes. Both batch jobs already have ClickHouse
+  configuration.
+
+  The tradeoff is:
+
+  • S3 dump: follows existing language-list implementations and requires less new reader code.
+  • Direct ClickHouse snapshots: avoids an additional S3 dump-readiness dependency and allows explicit selection of the snapshot time, but needs a new shared reader/query.
+
+  I found no existing Scala full-language-list reader in the checked files. My preference is direct ClickHouse snapshots for these two batch jobs, using one shared reader, since their primary language already comes from ClickHouse. The S3 approach
+  remains a well-established alternative.
+
+Q:
+› OK, but I don't understand, why do we need to do this: 'postgres_snapshot__account_languages, joins postgres_snapshot__language'?
+
+A:
+• account_languages stores the relationship using a numeric language_id. The readable code, such as en or ru, is stored in the language dictionary.
+
+  For example:
+```r
+  account_languages                 language
+  account_id | language_id          id | code
+  42         | 1                    1  | en
+  42         | 7                    7  | ru
+```
+  Joining on language_id = id gives us langList = ["en", "ru"] for account 42.
+
+  The existing S3 dump already performs this join and includes code. If we read the ClickHouse snapshots directly, we need to perform it ourselves.
+
+Q:
+› OK, got it, thanks. Can you check the lineage for account_languages S3 dump?
+
+A:
+• I’ll trace both export paths for the S3 dump, including the Airflow switch between them and the dbt models behind the snapshot export.
+
+• The dump has two possible lineages. In the dbt path, it is a projection of the two ClickHouse snapshots we discussed, so reading those snapshots directly would use the same upstream data. The direct Spark path reads PostgreSQL instead. Airflow
+  variables select which path is active; I can’t determine their deployed values from repository code.
+
+• Yes. The S3 dump has two possible lineages, selected per table by the postgres_dumps DAG.
+
+  1. ClickHouse/dbt export
+
+  PostgreSQL account_languages + language
+      → Debezium / CDC history
+      → ClickHouse snapshots for the requested date/hour
+      → intermediate.postgres_dump__account_languages
+      → S3 Parquet partition
+
+  The dbt dump model (/workspace/gameram-dwh/gameram_dbt/models/intermediate/postgres_dump/postgres_dump__account_languages.sql) reads both snapshots at the same query_date_time, joins on language_id = language.id, and outputs:
+
+  execution_date, execution_hour, account_id, language_id, code
+
+  It keeps all account-language relationships, without filtering to primary languages. It omits is_main_language.
+
+  Airflow waits for the account-language CDC SCD2 task, runs the dump model, exports the partition, and creates _SUCCESS. The dictionary snapshot is also read by the model, although that task group explicitly waits only for account_languages.
+  Export task group (airflow/dags/batch/imports/postgres_dump/postgres_dump.py:130).
+
+  2. Direct PostgreSQL/Spark export
+
+  PostgreSQL read replica:
+      account_languages + language
+          → PostgreSqlDump Spark job
+          → S3 Parquet partition
+
+  The Spark job (etl/src/main/scala/com/gameram/batch/extract/PostgreSqlDump.scala:31) reads both tables through JDBC and joins them. It preserves the account-language columns and adds code.
+
+  Unlike the dbt path, this reads the database state when the job executes; the requested hour determines the output path, rather than reconstructing historical state. It also uses an inner join, whereas the dbt model uses a left join.
+
+  Both paths publish under:
+
+  s3://gameram-data/postgres-dump/account_languages/dt=YYYY-MM-DD/hour=HH/
+
+  The DAG selection logic (airflow/dags/batch/imports/postgres_dump/postgres_dump.py:282) uses POSTGRES_DUMP_SUBSTITUTION_ENABLED and POSTGRES_DUMP_SUBSTITUTION_TABLE_LIST. Their deployed values determine the active path; repository code alone
+  cannot confirm those values.
+
+  For our task, both paths provide the full language list through account_id and code. When the dbt path is active, reading ClickHouse snapshots directly would use the same upstream data while bypassing the intermediate dump and S3 export.
+
+Q:
+› I extracted variables for you: '''
+  "POSTGRES_DUMP_SUBSTITUTION_ENABLED": true,
+  "POSTGRES_DUMP_SUBSTITUTION_TABLE_LIST": [
+    "account",
+    "account_device",
+    "account_explore_goals",
+    "account_explore_goals_games",
+    "account_games",
+    "account_languages",
+    "account_marks",
+    "account_platforms",
+    "account_status",
+    "account_status_types",
+    "account_subscriptions",
+    "account_survey",
+    "comment",
+    "comment_likes",
+    "device_languages",
+    "game",
+    "game_tag",
+    "image_info",
+    "language",
+    "mobile_device_info",
+    "moderation_marks",
+    "play_together_poll",
+    "playerid",
+    "post",
+    "post_likes",
+    "push_group_settings",
+    "tribe",
+    "tribe_member",
+    "tribe_thread",
+    "udidacc_games"
+  ]
+  '''
+
+A:
+• That confirms the ClickHouse/dbt path is active for account_languages:
+
+  PostgreSQL → CDC → ClickHouse snapshots
+      → postgres_dump__account_languages → S3
+
+  The deployed S3 dump therefore contains all account-language relationships with code, but omits is_main_language.
+
+  For batch langList, we can either consume that dump or query its underlying ClickHouse snapshots directly. Both use the same upstream source; the direct query avoids waiting for the additional dump/export stage.
+
+Q:
+› I think I'll choose S3 dump. It is already used in other jobs, it is ready (no extra join required), and reading from S3 more reliable in general, for batch jobs. Agree?
+
+A:
+• Agreed. The S3 dump is an established input, already includes language codes, and avoids adding a new ClickHouse query.
+
+  For both batch jobs, we’ll use:
+
+  • lang: user_profile_snapshot.language_code.
+  • langList: distinct codes from the account_languages S3 dump, grouped by valid account_id.
+
+  We should align the selected dump partition with the job’s reference time and ensure its _SUCCESS marker is available before reading.
+
+Q:
+› OK, so we analysed data sources and discovered details that help us to make required choices. I think you should update our document with those findings, important details about datasets, and our choices. Add short summary in the end, that
+  should help us to move to implementation phase.
+
+A:
+• I’ll update the task document with the confirmed source contracts, your choices, and a short implementation summary at the end.
+
+• The document now records the batch source choices and active dump lineage. I’m finishing the streaming contract and keeping the remaining implementation decisions—such as empty-list handling and snapshot timing—explicit.
+
+• Updated MLDE-39-gyml-user-lang.md (MLDE-39-gyml-user-lang.md) with the confirmed source behavior, active S3 lineage, accepted fallbacks, and source choices.
+
+  Added the remaining implementation decisions, an updated checklist, and a short implementation summary at the end. All local links and cross-repository references were verified.
+
+Q:
+› OK, I commited changes. Do we ready to start implementation?
+
+A:
+• Yes. The source choices are settled.
+
+  I suggest starting with the shared batch language preparation: read lang directly from registered-user profiles and build langList from the S3 dump. Then integrate it into each batch job, update streaming, and handle Redis schemas.
+
+  Before the first patch, we should settle two details: the snapshot/partition time to use, and the output when no languages are available. The remaining choices can be addressed with the relevant component, one step at a time.
+
+Q:
+› I have other sequence in mind, we will get back to it. Now lets discuss those two details. Lets start with the 'output when no languages are available'. I need more detail on that: what do you mean?
+
+A:
+• I mean the cases where the source provides no usable language value. We need to decide what to write to Redis in those cases.
+
+  For batch jobs, the two sources can differ:
+```r
+   Profile language_code    S3 account-language rows    Possible output
+  ━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   en                       en, ru                      lang = en, langList = [en, ru]
+  ───────────────────────  ──────────────────────────  ───────────────────────────────────
+   en                       No rows                     lang = en, langList = []
+  ───────────────────────  ──────────────────────────  ───────────────────────────────────
+   Missing                  en, ru                      lang unknown, langList = [en, ru]
+  ───────────────────────  ──────────────────────────  ───────────────────────────────────
+   Missing                  No rows                     lang unknown, langList = []
+```
+  The second case can legitimately happen because the profile may fall back to a device language, while the list contains only account languages. We should decide whether to keep those meanings separate or insert the fallback language into the
+  list.
+
+  For streaming, languageCodes can be empty or absent. We need to decide whether that should clear previously stored languages, preserve them, or fall back to locales. A DELETE event remains a deletion regardless.
+
+  My suggestion is:
+
+  • Batch: preserve each source’s meaning. Missing primary language stays unknown; missing account languages produce an empty list. Do not invent a primary language from the list or insert a device fallback into it.
+  • Streaming: agree on empty/absent-field semantics after checking the existing state-update behavior.
+  • Redis: represent unknown/empty values consistently with its existing encoding conventions; an empty list must not leave stale language values behind.
+
+  A registered user can have missing language data, so we should not filter out the user solely for that reason.
+
+Q:
+› OK, got it. For batch: in code we should have default value for unknown string data, and langList in the end is a string (TAG type in redis index). So, if we have no data here, we use default string value. Agree?
+
+A:
+• Agreed. In batch jobs, both lang and the final serialized langList should use the existing default string value when no usable data is available.
+
+  We can keep langList as an array during preparation, then serialize it for Redis. An empty list becomes the default string, ensuring an update replaces any previously stored value.
+
+Q:
+› Empty list is overkill, null (scala Option) should do the trick, don't you think?
+
+A:
+• Yes. Use Option[Array[String]] during preparation: Some(languages) when data exists, None otherwise. The Redis encoder then maps None to the configured default string.
+
+  That keeps missing data explicit without introducing an empty-list value.
+
+Q:
+› OK, now about streaming. How unknown data handled in current version?
+
+A:
+• I’ll trace how missing language data passes through streaming normalization, state merging, and Redis encoding in the current code.
+
+• Currently, missing language data ends up as the string "NULL" in Redis.
+
+  The flow is:
+
+  1. Missing/null languageCodes and locales become empty arrays.
+  2. parseLang() uses all languageCodes, joined with commas. If empty, it extracts codes from locales. If both are empty, it returns "".
+  3. State merging takes the language from the selected account update—even when it is empty. It does not preserve an older nonempty language in that case.
+  4. Redis encoding converts "" to GymlNDefaults.DEFAULT_TAG, which is "NULL".
+
+  Thus, an account update with neither language source replaces the previous Redis language with "NULL". Unrelated activity events retain language from the account-update state.
+
+  See language parsing (etl/src/main/scala/com/gameram/streaming/model/KafkaEvents.scala:183), state merging (etl/src/main/scala/com/gameram/streaming/gymln/GymlNRecordState.scala:157), and default value (etl/src/main/scala/com/gameram/streaming/
+  gymln/GymlNRecordState.scala:255).
+
+Q:
+› OK, we should use this convention: if we have no data we write default value. In redis index, lang and langList are TAG type, so 'DEFAULT_TAG' is still in use. Good?
+
+A:
+• Agreed. For both lang and langList, missing data must replace the Redis field with DEFAULT_TAG ("NULL"), rather than preserve an older value.
+
+  In batch preparation, we’ll represent missing values with None; the Redis encoder will apply the default. Streaming will follow the same output convention.
+
+Q:
+› By the way, check how batch processing absent data while encoding for redis
+
+A:
+• I’ll check how the batch Redis encoder handles null strings, optional arrays, and the configured default values.
+
+• Batch encoding already supports our convention through nullValue in each field’s YAML configuration.
+```r
+   Input reaching the encoder                          Redis value
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   null—including Scala None after Spark conversion    Configured nullValue
+  ──────────────────────────────────────────────────  ───────────────────────────────
+   Empty array                                         Configured nullValue
+  ──────────────────────────────────────────────────  ───────────────────────────────
+   Array ["en", "ru"] with isArray: true               "en,ru"
+  ──────────────────────────────────────────────────  ───────────────────────────────
+   Empty string ""                                     ""—not replaced automatically
+```
+  Both GYML batch configurations explicitly set nullValue: "NULL" for lang. We should use the same setting for langList, with isArray: true.
+
+  So Option[Array[String]] works as proposed: None becomes Redis "NULL". We should normalize unusable empty strings to None during preparation.
+
+  One distinction: batch uses configured nullValue, rather than the streaming DEFAULT_TAG constant. Its generic default is "EMPTY", so explicitly configuring "NULL" matters. See RedisIndexEncoder.scala (etl/src/main/scala/com/gameram/batch/redis/
+  RedisIndexEncoder.scala:54).
+
+Q:
+› OK, good. We should use existing conventions, for sure. Do we have other topics to discuss?
+
+A:
+• Yes—two decisions remain:
+
+  1. Batch reference time. The current profile adapter reads the job’s end date at 23:00, even when the job targets an earlier hour. I suggest reading both the profile and language dump for the job’s reference date/hour, with _SUCCESS readiness
+     checks for the dump.
+
+  2. Streaming locale fallback. When languageCodes is empty, the current code falls back to locales. Should we retain that? My suggestion is to retain it for compatibility, using the first extracted code for lang and all extracted codes for
+     langList. Their order cannot establish primacy, but it fits the accepted first-available fallback.
+
+  We should also preserve the agreed source meanings: a batch device-fallback lang need not appear in the account-only langList. Redis schema rollout can be discussed when we reach that implementation step.
+
+Q:
+› OK, batch reference time: last available actually reads exactly last available hour partition for given day. You can trace code in dbt project if you need proof. For regular job we don't need backfill mode, only current hour to keep index fresh.
+  So it is good enough fo me. For regular 'every hour' job we use airflow sensor to be sure that data is ready. For one-time jobs we use data aggregated for many days, so it's not a big problem if we miss an hour. It is domain-specific nuances, no
+  problem here. Am I managed to explain it, or you need more info?
+
+A:
+• Yes, that’s enough. We’ll preserve the existing batch time-selection behavior and readiness sensors. We won’t add backfill semantics or require exact-hour alignment for this task.
+
+  The only remaining source-behavior decision is whether to retain the streaming fallback from empty languageCodes to locales.
+
+Q:
+› Streaming locale fallback: absolutely. It is accepted behaviour, and this fallback works fine still. OK?
+
+A:
+• Agreed—we’ll preserve the streaming locale fallback:
+
+  • Use languageCodes when nonempty; otherwise extract codes from locales.
+  • Write the first available code to lang and all available codes to langList.
+  • If neither source provides data, write the existing default TAG value.
+
+  The source-behavior decisions are now settled.
+
+Q:
+› OK, perfect. Now lets get back to the implementation sequence. For start I want to implement fix to the streaming job. Try to change as little code as possible, OK?
+
+A:
+• I’ll update the streaming job first, preserving the locale fallback and default TAG convention. I’ll keep the patch focused on language parsing, state, and Redis output.
+
+• The existing state already holds the full comma-separated language list, including the locale fallback. I can derive both Redis fields at the write boundary, avoiding a state-schema change: lang gets the first code, and langList gets the full
+  string.
+
+• Implemented in RedisIndexOps.scala (etl/src/main/scala/com/gameram/streaming/gymln/RedisIndexOps.scala:44):
+
+  • lang gets the first language.
+  • langList gets the full comma-separated list.
+  • Locale fallback and "NULL" defaults are preserved.
+
+  Only two executable lines changed; the streaming state schema stays compatible.
+
+  Six tests passed, covering language ordering, fallback, missing data, state updates, and the existing Spark pipeline. Redis search-schema changes remain a separate step.
+
+Q:
+› Perfect, accepted. Do we have index schema and/or documentation in this repo, that we need to update?
+
+A:
+• I’ll look for the newcomers Redis index schema and any documentation describing its language fields.
+
+• Yes—two documents need updates:
+
+  • README.md (README.md:617): document the new meanings of lang and langList, the locale fallback, and "NULL" defaults. Its FT.CREATE example (README.md:670) also needs langList TAG.
+  • MLDE-39-gyml-user-lang.md (MLDE-39-gyml-user-lang.md): record the accepted missing-value and timing conventions, plus the completed streaming change. Note that the implementation preserves the existing state schema.
+
+  I found no executable newcomers index-schema creation in this repo—the streaming job writes hashes only. Existing deployed Redis search indices will therefore need a separate schema update.
+
+  No additional streaming YAML fields are required.
+
+Q:
+› OK, update README, please.
+
+A:
+• I’ll update the newcomers README section with the language-field behavior and add langList TAG to its index-creation example.
+
+• Updated README.md (README.md:641) with the language-field behavior, locale fallback, "NULL" defaults, and langList TAG in the FT.CREATE example. Diff checks passed.
+
+Q:
+› Good, I rewrite it a little and commited. Now update the file 'MLDE-39-gyml-user-lang.md', please
+
+A:
+• I’ll update the task document with the accepted conventions and completed streaming work, including the minimal Redis-writer implementation.
+
+• Updated MLDE-39-gyml-user-lang.md (MLDE-39-gyml-user-lang.md) with the accepted defaults and timing conventions, completed streaming implementation and tests, README update, and remaining batch/schema work.
+
+  Only the task document changed; diff and link checks passed.
+
+Q:
+› OK, commited, thanks. Next in our agenda is two batch jobs. I think we do this later, I need to divert my attention to other stuff, sorry.
