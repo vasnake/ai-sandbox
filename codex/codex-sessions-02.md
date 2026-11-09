@@ -1532,3 +1532,5 @@ A:
 
 Q:
 › OK, commited, thanks. Next in our agenda is two batch jobs. I think we do this later, I need to divert my attention to other stuff, sorry.
+
+# 2026-11-09 changes in data/etl jobs (continue)

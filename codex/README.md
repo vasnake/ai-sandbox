@@ -30,4 +30,5 @@
 Результат: всё работает как требуется. Агент в песочнице, задачи решаются.
 
 # sessions
-[working sessions](./codex-sessions.md)
+- [working sessions 1](./codex-sessions-01.md)
+- [working sessions 2](./codex-sessions-02.md)

@@ -234,3 +234,51 @@ codex-cli 0.166.0
 setup-v2$  docker compose exec codex codex login status
 Logged in using ChatGPT
 ```
+
+# 2026-11-09 codex update
+
+Очередное обновление, не-деструктивное (временное)
+```sh
+docker compose exec --user root codex bash -o pipefail -c '
+  curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+  && TAR_OPTIONS=--no-same-owner \
+     CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+     CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+  && chmod -R a+rX /opt/codex \
+  && rm /tmp/install-codex.sh
+'
+```
+```log
+==> Updating Codex CLI from 0.166.0 to 0.167.0
+==> Detected platform: Linux (x64)
+==> Resolved version: 0.167.0
+==> Downloading Codex CLI
+==> Installing standalone package to /opt/codex/packages/standalone/releases/0.167.0-x86_64-unknown-linux-musl
+WARNING: Could not safely inspect old Codex releases; skipped remaining cleanup.
+==> /usr/local/bin is already on PATH
+==> Current terminal: codex
+==> Future terminals: open a new terminal and run: codex
+Codex CLI 0.167.0 installed successfully.
+```
+
+```sh
+docker compose exec --user root codex bash -c '
+  ls -lah /opt/codex/packages/standalone/releases/
+'
+```
+```log
+total 24K
+drwxr-xr-x 1 root root 4.0K Nov  9 10:10 .
+drwxr-xr-x 1 root root 4.0K Nov  9 10:10 ..
+drwxr-xr-x 5 root root 4.0K Oct 30 10:45 0.166.0-x86_64-unknown-linux-musl
+drwxr-xr-x 5 root root 4.0K Nov  9 10:10 0.167.0-x86_64-unknown-linux-musl
+```
+```sh
+docker compose exec --user root codex bash -c '
+  rm -rfv /opt/codex/packages/standalone/releases/0.166.0-x86_64-unknown-linux-musl \
+  && rm -fv /tmp/install-codex.sh
+'
+
+docker compose exec codex codex --version # codex-cli 0.167.0
+docker compose exec codex codex login status # Logged in using ChatGPT
+```
