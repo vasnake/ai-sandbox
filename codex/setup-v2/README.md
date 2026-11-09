@@ -282,3 +282,58 @@ docker compose exec --user root codex bash -c '
 docker compose exec codex codex --version # codex-cli 0.167.0
 docker compose exec codex codex login status # Logged in using ChatGPT
 ```
+
+# 2026-11-09 session export skill
+
+Q:
+› About this session. I want to do some analysis on our dialog, for that I need a text file, with my questions and your answers, but w/o commands log. It looks like '''Q:
+  › Good, I rewrite it a little and commited. Now update the file 'MLDE-39-gyml-user-lang.md', please
+
+  A:
+  • I’ll update the task document with the accepted conventions and completed streaming work, including the minimal Redis-writer implementation.
+  '''. Can you create such a file for today's session? In '/workspace/data/codex-session-20261109.md'?
+
+A:
+• I’ll look for today’s session transcript and export your messages and my replies, leaving out tool calls and command output.
+
+• Created codex-session-20261109.md (codex-session-20261109.md) with today’s questions and answers, including progress updates, without tool calls or command logs.
+
+Q:
+› Wow! Exactly what I needed, thanks.
+
+A:
+• You’re welcome!
+
+Q:
+› Probably we should add this 'reporting' skill to some settings? I think I will be using it for each session (almost each).
+
+A:
+• I’ll check the skill guidance so I can suggest where this reusable export workflow should live.
+
+• Yes—a reusable export-session-dialog skill is a good fit for this recurring workflow. Skills are intended to capture repeatable procedures. Official OpenAI documentation (https://developers.openai.com/plugins/concepts/skills)
+
+  I’d make it a personal skill, available across repositories, with these defaults:
+
+  • Run only when you request a session export.
+  • Export the current conversation for today, unless another period is specified.
+  • Preserve original wording, Markdown, and visible progress updates.
+  • Exclude tool calls, command output, internal reasoning, and injected instructions.
+  • Use your Q: / A: format.
+  • Save as codex-session-YYYYMMDD.md in the workspace root unless you specify another path.
+  • Report any gaps in the available transcript.
+
+  A small extraction script alongside the skill would make future exports consistent and quick.
+
+Q:
+› Good for me
+
+A:
+• I’ll use the skill-creator skill to create a personal export-session-dialog skill, with a reusable extraction script and the defaults we agreed on.
+
+• The skill and extraction script are in place. The defaults are today’s messages from the current conversation, the agreed Q/A format, and no automatic export on goodbye. I’m checking date filtering, log exclusion, formatting, and overwrite
+  protection before calling it ready.
+
+
+• Created and validated your personal export-session-dialog skill (/home/dev/.codex/skills/export-session-dialog/SKILL.md), available across repositories.
+
+  Next time, say “Export today’s session” or invoke $export-session-dialog. It uses the agreed format and excludes tool logs. Your existing export is unchanged.
