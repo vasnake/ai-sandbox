@@ -30,5 +30,10 @@
 Результат: всё работает как требуется. Агент в песочнице, задачи решаются.
 
 # sessions
+
 - [working sessions 1](./codex-sessions-01.md)
 - [working sessions 2](./codex-sessions-02.md)
+
+> Next time, say “Export today’s session” or invoke $export-session-dialog
+
+- [working sessions 3](./codex-sessions-03.md)
