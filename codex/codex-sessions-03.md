@@ -885,3 +885,417 @@ Q:
 A:
 
 • I’ll use the export-session-dialog skill to save today’s conversation in the agreed Q/A format, without tool calls or command logs.
+
+## 2026-11-13 gyml-online dev
+
+Q:
+
+› Hi, where were we?
+
+
+A:
+
+• We’re working on **MLDE-654: automating gyml-online**, currently reproducing the existing notebooks before fixes or refactoring.
+
+Completed and committed:
+
+- Documented the pipeline, datasets, transformations, and decisions in `MLDE-654-gyml-online-auto.md`.
+- Created `ml/gyml_online/prepare_dataset.py` and `train.py`, preserving notebook logic with the agreed paths and settings.
+- Both local smoke tests passed. READMEs and progress notes are updated.
+
+**Next:** run preparation and training against real data, then verify schemas, row counts, checkpoints, and resource usage. The last session lacked AWS credentials, AWS CLI, and prepared data.
+
+Our reference is `MLDE-479-nbclean`, workdir `/tmp/ml/gyml_online/MLDE-479-nbclean`, using local Spark and CPU. Training currently attempts S3 publication after export, so that step needs attention before the real run.
+
+
+Q:
+
+› Ah, OK, got it. Lets continue. I have done checking, running and validating our two scripts. They works as they should, we did good job. I've updated a little documentation and scripts code, take a look
+
+
+A:
+
+• I’ll read your updates and compare them with the previous versions to understand the current scripts and documentation. I’ll take your real-data validation as confirmed and keep deferred fixes outside this pass.
+
+• I’ve read the updates. The reproduction phase is complete, based on your real-data validation; we’re now at pipeline design.
+
+The changes capture:
+
+- Shared version naming via `ONLINE_INDEX_VERSION`.
+- Preparation constants for the date range, platforms, and game limit.
+- Actual dataset sizes, schema, samples, feature distributions, and vocabulary sizes.
+- Evaluation of `"final"` and `"14000"` checkpoints; export still selects `"final"`.
+- TODOs for PySpark-job integration, configuration, paths, and checkpoint selection.
+
+Three documentation details remain stale:
+
+- The task document still says real-data execution is pending.
+- README says checkpoint comparisons are empty by default.
+- The service README link should use `../../gyml_online/README.md`.
+
+The recorded game vocabulary size is **159**, while serving still hardcodes **228**—the known integration point to address in the next phase.
+
+No files changed or real-data runs repeated.
+
+
+Q:
+
+› OK. Stale documentation details we will update after this: move our two scripts to 'ml/gyml_online/notebook_migration/' and make a note that it is a result of the first stage of migration from manual pipeline to auto. We will use those scripts as a source of logic (code) for production-ready modules, but should not edit them.
+
+
+A:
+
+• I’ll move both scripts into `notebook_migration/`, update their tests and documentation references, and document them as frozen stage-one outputs to use as references for production modules.
+
+• Moved both scripts to [notebook_migration/](/workspace/data/ml/gyml_online/notebook_migration/) with their contents unchanged.
+
+Documented them as frozen stage-one references, added scoped `AGENTS.md` guidance, and updated imports and commands. Both smoke tests passed.
+
+The broader stale-documentation cleanup remains for the next step.
+
+
+Q:
+
+› move their tests also, please
+
+
+A:
+
+• I’ll move the tests alongside the frozen scripts and update their documented paths.
+
+• Moved both tests to `ml/gyml_online/notebook_migration/tests/` and updated documentation paths. Both tests passed from their new location.
+
+
+Q:
+
+› OK, commited. Now we can fix stale docs
+
+
+A:
+
+• I’ll update the stale status, checkpoint-comparison description, and service README link to reflect the validated migration and frozen reference layout.
+
+• The docs now mark real-data reproduction as complete and production-pipeline design as the current phase. They also reflect comparison of `"final"` and `"14000"` checkpoints while export still selects `"final"`. Service compatibility and deployment remain separate checks; the frozen scripts are untouched.
+
+• Updated the task document and README:
+
+- Marked real-data reproduction complete; production design is next.
+- Removed stale execution blockers.
+- Corrected checkpoint-comparison details and the service README link.
+- Preserved all 73 decision IDs.
+
+Links validated. Frozen scripts and tests unchanged.
+
+
+Q:
+
+› OK, now - the interesting part: design of a new system. First we should discuss an overwiew of a system, reveal non-obvious hurdles, and solve them. Ater we agree on details, we should create a design-doc where we describe our solution and decisions. And after that we could implement the design. As simple as that. OK?
+
+
+A:
+
+• Agreed. We’ll discuss the system overview, identify the non-obvious hurdles, and work through the decisions first. Once the design is agreed, we’ll write the design document, then implement it component by component.
+
+The validated migration scripts remain frozen references throughout.
+
+
+Q:
+
+› OK. As I see it, the automated gyml-online pipeline will be orchestarated by some Airflow DAG, similar to dag 'gyml_gnn_train'. The new DAG name will be 'gyml_online_train'. DAG parameters 'run_dth' and the list of stages to run, like in gyml_gnn_train. Stages: 'data_collect', 'train', 'deploy'.
+
+
+A:
+
+• Agreed. The orchestration outline is:
+
+- **DAG:** `gyml_online_train`
+- **Parameters:** `run_dth` and `stages`
+- **Stages:** `data_collect` → `train` → `deploy`
+
+We can follow `gyml_gnn_train` for selecting stages and passing the reference date/hour.
+
+One important contract to settle next: **when earlier stages are skipped, how does a selected stage identify the existing artifacts it should consume?** For example, running only `deploy` must identify a particular trained online-model version.
+
+That connects to where we define the upstream GYML `index_id` and the online version suffix. We should settle those identities before detailing the stages.
+
+
+Q:
+
+› We have more than one connection to external systems and artifacts. They will be revealed as we discuss pipeline stage-by-stage.
+
+
+A:
+
+• Understood. We’ll work through `data_collect`, `train`, and `deploy` in order, identifying each stage’s inputs, outputs, external connections, and behavior when other stages are skipped.
+
+
+Q:
+
+› OK, data_collect stage. It is our 'prepare_dataset' script, but implemented as AWS EMR step (spark-submit job), similar to 'batch.gyml.train_tasks.data_collect.DataCollectTasks.get_collect_nodes_tg', for example. Lets say in file 'ml/data/pyspark_job/gyml_online.py'. It needs features-date-range as a parameter, which require 'run_dth' as a base and number of days as a range size. Also it needs 'index_id' and 'index_id_online' as S3 path variables, so it could write result to path like 's3://gameram-data/gyml/gyml-online/data/MLDE-479-nbclean-261111/dt=2026-11-13/hour=14/'. Here 'MLDE-479-nbclean' is index_id, and '261111' is index_id_online - gyml-online model version under upstream 'MLDE-479-nbclean' effectively.
+
+
+A:
+
+• I’ll check the existing EMR-step and PySpark job conventions so we can discuss the stage’s interface and S3 outputs concretely. I won’t change code yet.
+
+• Agreed. `data_collect` becomes an EMR Spark step, implemented in `ml/data/pyspark_job/gyml_online.py` and launched through the existing PySpark runner conventions.
+
+Its inputs are:
+
+| Parameter | Role |
+|---|---|
+| `run_dth` | Snapshot cutoff and output partition date/hour |
+| Features range size | Number of event-history days, initially 30 |
+| `index_id` | Upstream GYML model ID: `MLDE-479-nbclean` |
+| `index_id_online` | Online version within that upstream model: `261111` |
+
+Keeping our agreed one-day offset, Airflow derives the inclusive event range:
+
+```text
+date_to   = run_dth - 1 day
+date_from = date_to - range_size
+```
+
+It can pass that range, `run_dth`, and both IDs to the Spark job. Spark reads sources directly from S3; the local download/cache step belongs only to the frozen reproduction scripts.
+
+For `run_dth = "2026-11-13 14"`, the final prepared dataset goes to:
+
+```text
+s3://gameram-data/gyml/gyml-online/data/MLDE-479-nbclean-261111/dt=2026-11-13/hour=14/
+```
+
+One output-layout detail matters: **intermediate checkpoints must live outside that final dataset directory**, so training cannot accidentally read intermediate Parquet files as examples. We should settle their location and whether production preparation retains all existing checkpoint boundaries next.
+
+No code or design-document changes yet.
+
+
+Q:
+
+› Something like that, we will discuss details later. For now just take a note that they should be discussed, the job contract should be defined as exact as possible.
+
+
+A:
+
+• I’ll add a discussion note to the task document, marking the `data_collect` outline as provisional and listing the contract details we still need to define.
+
+• Noted in the task document: the `data_collect` outline is provisional. Its exact arguments, time boundaries, sources, output schema/paths, checkpoints, and rerun/failure behavior must be discussed and defined before implementation.
+
+
+Q:
+
+› OK, train stage. It is, basically, our train script, executed similar to 'batch.gyml.train_tasks.train.get_train_tg'. As parameters it needs 'index_id' and 'index_id_online', to find input data on S3 and write output on S3.
+
+
+A:
+
+• I’ll record the `train` outline using `get_train_tg` as the execution reference, with the exact input and output contract still to be defined.
+
+• Recorded the `train` outline: execute the training logic using the existing remote-training pattern, with `index_id` and `index_id_online` identifying S3 inputs and outputs.
+
+Also noted that selecting the dated input partition must be defined in the exact contract.
+
+
+Q:
+
+› sure, 'run_dth' also should be passed as parameter to help with path resolving
+
+
+A:
+
+• I’ll add `run_dth` to the training parameters for path resolution.
+
+• Recorded: training receives `index_id`, `index_id_online`, and `run_dth` for S3 path resolution.
+
+
+Q:
+
+› OK, 'deploy' stage. It will be not trivial. The idea is similar to airflow dag 'feed_als_ml_train', where we use 'batch.feed.als_train.get_gitlab_tg' to start gitlab ci/cd pipeline. We should make changes in project 'gyml_online/' so we could trigger its ci/cd pipeline. And that ci/cd will be building docker image and create/update AWS ECS service. As of now I can see this important parameters: deploy env selector - prod or develop; split name to define endpoint name (control or treatment), index_id and online_index_id to help with path resolving.
+
+
+A:
+
+• I’ll check the ALS GitLab-trigger pattern and the current gyml-online CI/CD inputs, then record this deploy-stage outline and the contract details still to discuss.
+
+• Recorded the provisional `deploy` outline: Airflow triggers and monitors GitLab CI/CD, which builds/tests the image and creates or updates ECS.
+
+Initial inputs are environment, split, upstream ID, and online model version. Environment and split remain separate selectors.
+
+Noted for later discussion: exact variable names, artifact paths, image versioning, Git ref, and deployment-success criteria—including standardizing `index_id_online` versus `online_index_id`.
+
+
+Q:
+
+› OK, now we should settle where parameters should be defined: I can see at least 3 category of parameters, based on the place of definition: dag-run parameter with value defined in web-ui form in the moment of manual start of the dag; pipeline parameter with value defined as global python variable in dag module; config parameter with value defined in some yaml config, usually for a particular job.
+
+
+A:
+
+• Yes—those three categories give us a clear ownership model:
+
+| Category | Defined in | Purpose | Examples |
+|---|---|---|---|
+| **DAG-run parameters** | Manual-start form | Values chosen for a particular execution | `run_dth`, `stages` |
+| **Pipeline parameters** | DAG-module globals | Configure the pipeline and coordinate stages | Model IDs, deployment environment/split, package versions, EMR/EC2 resources, Git ref |
+| **Job configuration parameters** | Job YAML | Control a job’s data processing or model behavior | Cold-user threshold, game limit, vocabulary threshold, batch size, epochs, optimizer settings |
+
+The examples beyond `run_dth` and `stages` are proposed assignments—we should agree on their placement.
+
+Two principles would help:
+
+- **One authoritative definition per parameter.** Passing a pipeline parameter to a job or GitLab makes it an input there, not another independently configured value.
+- **Derive values rather than configure them separately.** Combined model IDs, date ranges, and resolved S3 paths should come from their constituent parameters.
+
+One non-obvious case is **feature-range size**. If Airflow computes the range and uses it for readiness checks, the size belongs at pipeline level. If only the Spark job needs it and computes the range itself, it can belong in that job’s YAML. We should choose the owner alongside the job contract.
+
+Similarly, the job contract should identify which values are supplied by orchestration and which come from YAML, including any permitted overrides.
+
+
+Q:
+
+› We should create a table that describe all our parameters. For each parameter there should be name, short description explaining meaning of parameter, category, default value if any, data type and format, examples.
+
+
+A:
+
+• I’ll add a parameter inventory to the task document with those columns. I’ll mark unsettled names, categories, and defaults explicitly so the table doesn’t turn proposals into decisions.
+
+• I’m separating explicit inputs from derived values such as date ranges and S3 paths. The table will also distinguish frozen-script values from proposed production defaults; those aren’t automatically the same.
+
+• Added the [draft parameter inventory](/workspace/data/MLDE-654-gyml-online-auto.md#parameter-inventory-draft) with all six requested columns.
+
+It separates run/pipeline parameters, job/service settings, and derived values. Unsettled categories, names, and defaults are marked explicitly; existing values are shown as reference examples.
+
+No implementation changes.
+
+
+Q:
+
+› Well, by the way, design notes for automated pipeline should be placed in a ne file, lets name it 'MLDE-654-gyml-online-auto-design.md.
+
+
+A:
+
+• I’ll move the automated-pipeline discussion notes and parameter inventory into `MLDE-654-gyml-online-auto-design.md`, and link it from the original task document.
+
+• Moved the automated-pipeline notes and parameter inventory to [MLDE-654-gyml-online-auto-design.md](/workspace/data/MLDE-654-gyml-online-auto-design.md).
+
+The original document links to it and retains the investigation, reproduction decisions, and validation history. All entries and source links were preserved.
+
+
+Q:
+
+› Good. I still have a few notes about my view on 'how it should work' in general. Parameters 'deploy env' and 'split' should be in the category of dag-run. gyml-online train script should be similar to GYML GNN train script it the way how it operates (config, pre/post train, adapters, logs). Probably we should add 'gyml-online' submodule to hydra ml/configs. Path resolving everywhere should be implemented as methods or properties of a class e.g. PathResolver.
+
+
+A:
+
+• I’ll record these design constraints: deployment environment and split as DAG-run inputs, GYML-style training structure, the proposed Hydra config group, and centralized path resolution.
+
+• Updated the design draft:
+
+- `deploy_env` and `split` are now **DAG-run parameters**.
+- Training follows GYML GNN’s config, pre/post-train, adapter, and logging structure.
+- A `gyml-online` Hydra group under `ml/configs/` is recorded as a proposal.
+- Production paths are resolved through class methods/properties, such as `PathResolver`.
+
+The resolver’s packaging across Airflow, EMR, training, and CI remains a detail to settle.
+
+
+Q:
+
+› Great! One more, about dependencies. The system engaged three 'data' components: airflow, gyml_online, and ml. Airflow DAG will be using ml package version and gyml_online git tag as dependency, in form of pipeline parameters. And gyml_online will be using ml package version, as ml model inference code should be resided in ml package. In that case ml package version looks like a config parameter and it place is in 'gyml_online/versions.yaml' probably.
+
+
+A:
+
+• I’ll add that dependency relationship to the design and clarify the two uses of the ML package version: a pipeline input in Airflow and a service dependency in `gyml_online/versions.yaml`. We’ll also need to define which value wins when CI receives an override.
+
+• Yes—the category depends on who defines and consumes the value:
+
+- **Airflow:** ML package version and gyml-online Git tag are pipeline parameters.
+- **gyml_online:** its ML inference dependency belongs in service configuration, probably `versions.yaml`.
+- **ml:** owns the model inference implementation consumed by the service.
+
+Recorded this in the design draft, with `components.ml_package_version` as a proposed YAML key.
+
+One contract remains open: whether the service tag pins that dependency and Airflow must match it, or CI permits an explicit override. We should avoid silently combining incompatible trained state and inference code.
+
+
+Q:
+
+› there will be no override in CI, for CI only one ml package version should be visible, from 'versions.yaml'.
+
+
+A:
+
+• I’ll record `gyml_online/versions.yaml` as CI’s sole source for the ML package version and remove the override option from the design.
+
+• Recorded: service CI reads the ML package version **only from `gyml_online/versions.yaml`**, with no override.
+
+Airflow’s ML package version configures preparation/training; the selected service Git tag pins the inference dependency used for deployment.
+
+
+Q:
+
+› OK, that should conclude design overwiew. Or am I missing something in the 'big picture'?
+
+
+A:
+
+• The overall shape is complete: **Airflow → EMR data collection → remote training → GitLab build/deploy → ECS serving**. We don’t appear to need another stage.
+
+Two cross-system responsibilities deserve an explicit place in the overview:
+
+- **Model compatibility:** how we verify that the trained state matches the inference code pinned by the selected service Git tag. This includes the model architecture, feature transformations, and upstream embedding space.
+- **Activation coordination:** how the deployed `control`/`treatment` endpoint stays paired with the correct upstream GYML index. Deploying a healthy service alone doesn’t establish that pairing.
+
+We can leave their exact mechanisms for detailed design, alongside checkpoint selection, artifact contracts, retries, and rollout success criteria. They don’t require changing the three-stage outline.
+
+
+Q:
+
+› For the first question I have a solution, more likely half of it: in CI we should perform smoke-test of a service. I believe current version have one. For the second question I can say only this: cross-system dependencies are still mostly manual-managed, but we have GYML_GNN_USER_INDEX_META in 'airflow/dags/batch/gyml/__init__.py:53', which controls index splits; we can check index_id against meta.
+
+
+A:
+
+• I’ll check the existing service smoke test and index metadata, then record what they cover and which dependencies remain manually managed.
+
+• Confirmed: CI already starts the built image and checks version, readiness, and inference. That covers model loading and basic execution, while semantic compatibility still needs artifact/version lineage.
+
+Recorded two checks in the design:
+
+- Preserve service-image smoke testing with the selected model and pinned ML package.
+- Validate `index_id` and requested split against `GYML_GNN_USER_INDEX_META`—currently `MLDE-479-nbclean` → `treatment`.
+
+Cross-system activation remains manually managed; the metadata check doesn’t verify live routing.
+
+
+Q:
+
+› OK, file ready for me to review?
+
+
+A:
+
+• Yes—[MLDE-654-gyml-online-auto-design.md](/workspace/data/MLDE-654-gyml-online-auto-design.md) is ready for your review. Agreed directions and open contract details are marked separately.
+
+
+Q:
+
+› Good job, although a little excessive for first approach to design-doc, IMHO. Too many mot really important details, masking important decisions. But it will do for now, thanks.
+
+
+A:
+
+• Understood. Future design updates will lead with the architecture and important decisions, keeping detailed inventories and implementation questions separate so they don’t obscure the main design.
+
+
+Q:
+
+› Export today’s session, please
+
+
+A:
+
+• I’ll use the export-session-dialog skill to save today’s questions and replies without tool calls or command logs.
