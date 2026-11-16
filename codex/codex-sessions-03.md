@@ -1299,3 +1299,414 @@ Q:
 A:
 
 • I’ll use the export-session-dialog skill to save today’s questions and replies without tool calls or command logs.
+
+## 2026-11-16 gyml-online dev
+
+Q:
+
+› Hi, where were we?
+
+
+A:
+
+• We’re working on **MLDE-654: automating gyml-online**. Reproduction is complete—you ran and validated both scripts on real data.
+
+The scripts and tests now live in **`ml/gyml_online/notebook_migration/`** and are frozen references.
+
+We’re discussing the production design in **`MLDE-654-gyml-online-auto-design.md`**:
+
+- DAG **`gyml_online_train`**, stages **`data_collect` → `train` → `deploy`**.
+- EMR prepares data; remote training follows the GYML training pattern; deployment triggers GitLab CI to build/test an image and update ECS.
+- DAG-run inputs include `run_dth`, `stages`, deployment environment, and split.
+- Training follows GYML’s configuration, adapters, pre/post steps, and logging structure.
+- Paths are centralized in a resolver class.
+- Service CI gets its ML inference-package version **only from `gyml_online/versions.yaml`**, without overrides.
+- CI smoke tests check service execution; index/split checks use `GYML_GNN_USER_INDEX_META`.
+
+**Next:** review the overview, settle exact stage contracts, then implement component by component. You also asked that future design updates stay concise and foreground important decisions.
+
+
+Q:
+
+› OK, got it. Lets dig in to data collect stage. We don't define parameters for spark-submit job, do we?
+
+
+A:
+
+• I’ll check the design draft to distinguish the parameters we’ve discussed from the exact job interface still to define.
+
+• Correct—we’ve identified the inputs, but **haven’t finalized the Spark job’s argument contract**.
+
+So far:
+
+- `index_id` — upstream GYML identity.
+- `index_id_online` — online-model version.
+- `run_dth` — snapshot cutoff and output partition.
+- Event range — either passed explicitly or calculated from range size and lag; ownership remains undecided.
+
+We still need the runner job name, exact arguments/order, configuration source, defaults, and validation. Spark execution options—memory, executors, cores—are a separate part of the EMR-step configuration.
+
+The production job isn’t implemented yet.
+
+
+Q:
+
+› OK. I see three positional arguments: index_id as arbitrary string; index_id_online also arbitrary string; features_date_range as a date range in form of 'from:to', like '2026-11-01 06:2026-11-16 12', where 'to' is our 'run_dth'.
+
+
+A:
+
+• I’ll record those three positional arguments, with `run_dth` derived from the range’s `to` value. I’ll also flag how that boundary relates to the previously agreed one-day event offset.
+
+• Recorded the positional order:
+
+```text
+index_id index_id_online "from:to"
+```
+
+Both IDs are arbitrary strings; `to` supplies `run_dth`, so no separate `run_dth` argument is needed.
+
+One detail to resolve next: should events use this range directly, or retain the previous one-day offset before `run_dth`?
+
+
+Q:
+
+› Actually no, 'run_dth' is defined on a top level, in airflow dag, by user. Remember? It is job parameter derived from run_dth.
+
+
+A:
+
+• You’re right—I blurred the direction of dependency. I’ll clarify that the user supplies `run_dth` to Airflow, and Airflow derives the job’s `features_date_range` from it.
+
+• Yes—the direction is:
+
+**User supplies `run_dth` → Airflow derives `features_date_range` → Spark job receives it.**
+
+The job’s three positional arguments remain unchanged. Corrected the design notes.
+
+
+Q:
+
+› Exactly, thanks. One-day offset remains, the job config processor should derive exact value from the 'features_date_range' parameter.
+
+
+A:
+
+• I’ll record that the job’s config processor derives the actual event window from `features_date_range`, retaining the one-day offset.
+
+• Recorded: Airflow passes the unshifted range; the job config processor shifts both endpoints back one day for events, preserving its length. Snapshots and output partitioning use the original `to` (`run_dth`).
+
+
+Q:
+
+› OK, that leads us to Job name and job yaml config file. Any good candidates for job name?
+
+
+A:
+
+• I’d suggest **`gyml_online_prepare_dataset`** as the runner job name: it identifies the subsystem and describes the work.
+
+Matching names:
+
+- Class: `GymlOnlinePrepareDatasetJob`
+- Module: `ml/data/pyspark_job/gyml_online.py`
+- YAML: `gyml_online_prepare_dataset.yaml`
+
+That keeps the Airflow stage name `data_collect` separate from the specific job it runs.
+
+
+Q:
+
+› I like your choice, if we'd go with it, job config file, according to project conventions, should be 'configs/etl/batch/gymlOnlinePrepareDatasetJob.yaml'
+
+
+A:
+
+• I’ll record `configs/etl/batch/gymlOnlinePrepareDatasetJob.yaml` alongside the agreed runner job and class names.
+
+• Agreed and recorded:
+
+- Job: `gyml_online_prepare_dataset`
+- Class: `GymlOnlinePrepareDatasetJob`
+- Config: `configs/etl/batch/gymlOnlinePrepareDatasetJob.yaml`
+
+
+Q:
+
+› Now about output. If we agree that path like `s3://gameram-data/gyml/gyml-online/data/MLDE-479-nbclean-261111/dt=2026-11-13/hour=14/` should be the path to collected dataset (parquet as format), then path like `s3://gameram-data/gyml/gyml-online/checkpoints/MLDE-479-nbclean-261111/dt=2026-11-13/hour=14/` should contain job checkpoints. In that case, path `s3://gameram-data/gyml/gyml-online` should be defined as 'basePath' in job config yaml, and used in path-resolver class to produce all required final paths.
+
+
+A:
+
+• I’ll record the separate dataset and checkpoint paths, with `basePath` defined in the job YAML and final paths derived by the resolver.
+
+• Agreed and recorded:
+
+```yaml
+basePath: s3://gameram-data/gyml/gyml-online
+```
+
+The resolver derives separate `data/` and `checkpoints/` paths using both IDs and `run_dth`. Final data is Parquet; intermediate stages live beneath the checkpoint root.
+
+
+Q:
+
+› Are we ready to implement data-collect job?
+
+
+A:
+
+• I’ll check the remaining contract notes against the existing PySpark job conventions to see whether anything still needs a decision before implementation.
+
+• Almost. The main contract is agreed: job name, three positional arguments, date processing, sources, output paths, and checkpoint root.
+
+One detail needs settling: **how the job receives its YAML configuration** from `configs/etl/batch/gymlOnlinePrepareDatasetJob.yaml`.
+
+I suggest distributing it through Spark’s `--files` option and loading it using `SparkFiles.get()`. Airflow supplies the deployed S3 config path; the job keeps exactly the three agreed positional arguments.
+
+For the initial implementation, we can preserve the validated preparation logic, checkpoint names, output schema, and overwrite behavior from the frozen script. Add focused tests for configuration/date processing, path resolution, and a small local Spark smoke test.
+
+With that configuration-delivery choice agreed, we’re ready to implement.
+
+
+Q:
+
+› Oh, of course, path to config file. It seems like we have to add one more parameter for our job: path created by function 'get_batch_config_path'. According to project's conventions, it is the usual way to pass config to a spark job.
+
+
+A:
+
+• I’ll update the design to add the config path as a fourth positional argument, supplied by Airflow through `get_batch_config_path()`.
+
+• Agreed. Updated the design with four positional arguments:
+
+1. `index_id`
+2. `index_id_online`
+3. `features_date_range`
+4. `config_path`, supplied through `get_batch_config_path("gymlOnlinePrepareDatasetJob.yaml")`
+
+The job will load YAML using the existing project helper. We’re ready to implement.
+
+
+Q:
+
+› OK, lets implement data-collect job
+
+
+A:
+
+• I’ll implement the job using the agreed contract and the validated preparation script, then run focused tests in the ML environment.
+
+• The runner already supports the four-argument contract, and the YAML loader handles S3 and local paths. I’ll keep the validated transformations and checkpoint stages, move path construction into a resolver, and write the final dataset separately. Event reads will use the requested hourly partitions, tolerating absent hours as the reproduction script did.
+
+• The seven focused tests passed, including a local Parquet run and rerun, date boundaries, output paths, and missing-history handling. I also found that `gyml_online/` needs an `__init__.py` for ZIP imports; I’ll add it and check imports from a real ZIP outside the source tree. Airflow wiring remains for a later step.
+
+• Implemented and ready for review:
+
+- [Data-collect job](/workspace/data/ml/data/pyspark_job/gyml_online.py), registered as `gyml_online_prepare_dataset`.
+- [YAML config](/workspace/data/configs/etl/batch/gymlOnlinePrepareDatasetJob.yaml) and shared path resolver.
+- Preserved transformations, one-day event offset, checkpoints, and overwrite behavior.
+- Updated README and design notes; frozen scripts remain unchanged.
+
+Validation: **8 tests passed**, including local Spark execution and rerun. ZIP imports and Black checks passed.
+
+Airflow wiring and execution on EMR remain pending.
+
+
+Q:
+
+› Good! Now check please, that you don't reinvent code already existing in ml/common packade
+
+
+A:
+
+• I’ll compare the new job and path resolver with `ml/common`, focusing on helpers we can reuse without changing behavior.
+
+• Yes—there are a few places where I duplicated existing functionality:
+
+- **`PLATFORMS`** already exists in [common/__init__.py](/workspace/data/ml/common/__init__.py:16). We should import it.
+- **Date-range parsing** overlaps with `parse_date_range()` in [common/date_utils.py](/workspace/data/ml/common/date_utils.py:48). We can reuse it, retaining job-specific validation requiring two explicit date/hour endpoints and correct ordering.
+- **Snapshot paths** duplicate `make_pg_input_path()` in [common/path_resolver.py](/workspace/data/ml/common/path_resolver.py:104). Our resolver can delegate to it while keeping the configured source root.
+- **Event reading** partially duplicates `read_parquet_paths()` in [common/readers.py](/workspace/data/ml/common/readers.py:11). That helper already handles missing partitions, but needs a small extension for reader options such as `basePath`, `mergeSchema`, and `ignoreCorruptFiles` before it can replace our implementation.
+
+We already reuse `Range`, `LoggingMixin`, `make_partition_paths()`, and `filter_existing_paths()`. The online-specific output paths, one-day offset, and transformations belong in the new implementation.
+
+I recommend consolidating those four areas. No files changed during this check.
+
+
+Q:
+
+› Looks good, lets try it
+
+
+A:
+
+• I’ll reuse those helpers, extend the shared Parquet reader without changing its existing callers, and rerun the relevant tests.
+
+• Done. The job now reuses `PLATFORMS`, `parse_date_range()`, `make_pg_input_path()`, and `read_parquet_paths()` from `ml/common`.
+
+The shared reader accepts optional reader options and `StructType` schemas while preserving existing call signatures. Job-specific date validation and the one-day offset remain in the config processor.
+
+**28 tests passed**, including shared-helper tests and the Spark smoke test. Black checks passed.
+
+
+Q:
+
+› Great! Please check again that job implementation reproduce logic from 'ml/gyml_online/notebook_migration/prepare_dataset.py'
+
+
+A:
+
+• I’ll compare the job with the frozen script stage by stage, including filters, joins, aggregations, and read/write boundaries, and separate intended path and runtime changes from any differences in dataset logic.
+
+• Checked again: **no unintended differences in dataset transformation logic found**.
+
+I also ran both implementations against the same local Parquet inputs. **All eight stages produced identical schemas and rows**, including the final dataset.
+
+Preserved behavior includes feature expressions, join types, registration-day filtering, pair deduplication, nested game aggregation, receiver-game intersections, and checkpoint boundaries.
+
+The intended differences are configuration/arguments, direct S3 reads, configurable date range, and separate dataset/checkpoint paths. With the YAML defaults and a 30-day range, these reproduce the reference settings.
+
+The reference’s nondeterministic selections remain unchanged. This verifies local smoke-data equivalence; EMR execution is still pending. No repository files changed during this check.
+
+
+Q:
+
+› Fantastic, thanks. What 'The reference’s nondeterministic selections' are you talking about?
+
+
+A:
+
+• Three operations can choose different results when input or Spark partition ordering changes:
+
+- **Language:** `any_value("code", ignoreNulls=True)` picks an unspecified non-null language when an account has several.
+- **Added games:** `row_number()` ordered by the constant `1` selects an arbitrary subset when an account has more than 32 games. `collect_list()` also leaves their order unspecified.
+- **Subscription event:** `dropDuplicates(["account_id", "receiver_id"])` retains an unspecified event when the same pair occurs repeatedly. Its `dt`, `hour`, and `isCrossSubscribe` can therefore vary.
+
+Additionally, `collect_set()` produces arrays with unspecified element order, although their membership stays the same.
+
+These behaviors already exist in the frozen script; the new job preserves them.
+
+
+Q:
+
+› OK, got it. We will deal with those later.
+
+
+A:
+
+• Understood. We’ll preserve those behaviors for now and address them during later refactoring.
+
+
+Q:
+
+› OK, lets create our airflow dag in 'airflow/dags/batch/gyml/gyml_online_train.py', using EmptyOperator as placeholders for train and deploy stages, OK?
+
+
+A:
+
+• I’ll add `gyml_online_train` with the data-collect EMR step and `EmptyOperator` placeholders for train and deploy, following the existing GYML DAG conventions.
+
+• I’ll keep the IDs, ML package version, and 30-day range size as module-level settings, with `run_dth`, stages, deploy environment, and split in the launch form. Data collection will submit and monitor one EMR step; train and deploy will only mark their selected stages complete for now. I’ll also validate the index/split pairing against the existing metadata.
+
+• The DAG is in place, including stage selection that allows later stages to run when an earlier one is skipped. I initially ran `uv sync` from the repository root; I stopped it and switched to the Airflow environment. No tracked dependency files changed. Next I’ll check DAG loading, rendered EMR arguments, and validation.
+
+• Created [gyml_online_train.py](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py).
+
+- `data_collect` submits and monitors the EMR job.
+- `train` and `deploy` use `EmptyOperator`.
+- Added stage selection, required `run_dth`, index/split validation, and documentation.
+
+**20 tests passed**; syntax and Black checks passed.
+
+Before running, publish the selected ML package and YAML config. Upstream readiness sensors remain pending.
+
+
+Q:
+
+› Good, fixed and commited. Thanks. Next, we will be creating train job, similar to 'gyml.gnn.ml_jobs.adapters.train_app.main'. It should reside in 'gyml.online' package and have entry in main python file. As gyml gnn, it should work from zip package. Should I provide more details?
+
+
+A:
+
+• I’ll check the GNN entry point, training lifecycle, and ZIP packaging conventions, then identify any details we still need to settle for `gyml.online`.
+
+• The structure is clear:
+
+- Entry point: `gyml.online.ml_jobs.adapters.train_app.main`.
+- Lifecycle: configuration → pre-train → training → post-train.
+- Packaged Hydra configuration, with interpolation encapsulated inside the config class.
+- Dispatch from `ml/__main__.py`, with source-tree and ZIP execution supported.
+- Training logic taken from the frozen script.
+
+Before implementation, we should settle three contract details:
+
+1. **CLI selector:** I suggest `+cmdline.ml_job=gyml_online_train`, with overrides for `index_id`, `index_id_online`, and the reference date/hour.
+2. **Artifact paths and contents:** where to publish the exported model, and whether to retain intermediate checkpoints or additional artifacts on S3. The prepared dataset path is already agreed.
+3. **Existing outputs:** preserve the reproduction’s overwrite policy, or follow GNN training and fail early when the S3 destination is nonempty?
+
+We can discuss these one at a time, starting with invocation.
+
+
+Q:
+
+› Great, three contract details then. CLI selector: I agree with your suggestion. Artifact paths and contents: S3 path for model should follow this pattern 's3://gameram-data/gyml/gyml-online/train/<index_id>-<id_online_version>/model/model_state.pth'. Only final model saved to S3, any intermediate files stays local. Existing outputs: follow GNN training ops.
+
+
+A:
+
+• I’ll record those decisions: `gyml_online_train` as the selector, only the final model published at the agreed S3 path, and GNN-style checks that reject a nonempty destination before training and again before upload.
+
+• Recorded in the design doc:
+
+- Selector: `+cmdline.ml_job=gyml_online_train`.
+- Final model: `{basePath}/train/{index_id}-{index_id_online}/model/model_state.pth`.
+- Intermediate files stay local.
+- Check the destination before training and before upload; reject existing outputs and propagate upload failures.
+
+That settles the three contract details. We’re ready to implement.
+
+
+Q:
+
+› Lets go
+
+
+A:
+
+• I’ll implement the online training job with the agreed lifecycle, packaged config, ZIP entry point, and S3 destination checks. I’ll use the frozen script as the source of training logic and keep the Airflow train placeholder for a separate step.
+
+• The frozen script relies on global paths and vocabulary sizes. I’ll make those explicit in the new modules while preserving its model, transforms, sampling, splits, and loss. I’ll also separate the shared path logic from PySpark imports so training can run in the existing non-Spark image. The automated job will evaluate the final checkpoint; manual comparisons such as step `14000` will remain in the reference script.
+
+• The training lifecycle is implemented, and the first smoke run completed training and export. The tests caught two issues—unresolved mandatory config values and a doubled slash in the upload key—which I’ve corrected. I’m now rerunning the checks, including training from a ZIP with PySpark imports blocked and regression tests for the GNN config and deployment flow.
+
+• Implemented and ready for review.
+
+- [Training entry point](/workspace/data/ml/gyml/online/ml_jobs/adapters/train_app.py) with config, pre-train, train, and post-train stages.
+- [Packaged config](/workspace/data/ml/configs/gyml-online.yaml), interpolation, and ZIP dispatch.
+- Final-model upload at the agreed path, with destination checks before training and upload.
+- Updated documentation; frozen scripts remain unchanged.
+
+**41 tests passed**, including transformation/model parity, failure handling, GNN regressions, and ZIP training without PySpark. Black checks passed.
+
+Real S3 execution and Airflow train wiring remain pending.
+
+
+Q:
+
+› Great, thanks! I'll do the review ASAP and let you know how it went
+
+
+A:
+
+• Sounds good. I’ll wait for your review feedback.
+
+
+Q:
+
+› Export today’s session, please
+
+
+A:
+
+• I’ll use the session-export skill to save today’s questions and answers without tool logs.
