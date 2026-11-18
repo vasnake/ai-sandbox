@@ -812,3 +812,811 @@ Q:
 A:
 
 • I’ll use the `export-session-dialog` skill to export today’s Q/A dialog without command logs.
+
+## 2026-11-18 gyml-online dev
+
+Q:
+
+› Hi, where were we?
+
+
+A:
+
+• We were testing the `gyml_online` service integration. The service now loads inference code from the ML ZIP pinned in `versions.yaml`. Since the trained model artifacts aren’t ready yet, we added a Docker test that downloads that ZIP from S3 and generates synthetic weights to check model loading and HTTP inference.
+
+**26 local tests passed**, including synthetic model creation and inference from a ZIP. The Docker run was the next step:
+
+```bash
+cd /workspace/data/gyml_online
+bash .ci/test_synthetic_model.sh
+```
+
+After that, the remaining pipeline work is wiring the Airflow `deploy` stage to GitLab CI and ECS.
+
+
+Q:
+
+› OK, got it, thanks. I'll get back to you when I finish checking
+
+
+A:
+
+• Sounds good. We’ll pick up when you have the Docker test results.
+
+
+Q:
+
+› I need your help with dev environment. For 'ml/' subproject we created 'uv' env earlier, if you remember. It is very convinient for local development. I want to create 'uv' env in 'gyml_online/' subproject, like we did for 'ml/'. Can you help me with that?
+
+
+A:
+
+• I’ll compare the `gyml_online` service runtime with the setup in `ml/`, then create a locked `uv` environment and verify that it can run the service tests locally.
+
+• The locked environment is installed, and all five endpoint tests passed with a ZIP built from the checkout. I also removed an unused file logger that tried to open `/var/log/gyml-online.log` at startup. I’ll check that the documented FastAPI command serves requests locally.
+
+• Set up a locked `uv` environment in `gyml_online/` for Linux x86-64. It uses Python 3.9.18, CPU PyTorch 2.3.0, and the same FastAPI and Pydantic versions as the service base image.
+
+```bash
+cd /workspace/data/gyml_online
+uv sync --dev --locked
+```
+
+The [README](/workspace/data/gyml_online/README.md) shows how to generate a synthetic model, run tests, and start the service locally. I removed an unused file logger so startup no longer needs write access to `/var/log`.
+
+Verified that FastAPI started and `/health` returned `ready`. All five endpoint tests passed with an ML ZIP built from the checkout. The published S3 ZIP wasn’t part of this check.
+
+
+Q:
+
+› Thanks, works perfectly! Now, I've got our test results, take a look: '''gyml_online$ bash -x .ci/test_synthetic_model.sh
++ set -euo pipefail
++ service_dir=/home/vlk/data/gitlab/gameram/data/gyml_online
+++ yq -er .components.ml_package_version /home/vlk/data/gitlab/gameram/data/gyml_online/versions.yaml
++ ml_version=v3.1.0-dev
++ [[ v3.1.0-dev != *-dev ]]
++ export ml_version
++ pushd /home/vlk/data/gitlab/gameram/data/ml
+~/data/gitlab/gameram/data/ml ~/data/gitlab/gameram/data/gyml_online
++ rm -v ./ml_package_files.zip
+removed './ml_package_files.zip'
++ git ls-files
++ xargs zip ml_package_files.zip
+  adding: .dockerignore (stored 0%)
+  adding: .gitignore (stored 0%)
+  adding: .gitlab-ci.yml (deflated 59%)
+  adding: .python-version (stored 0%)
+  adding: AGENTS.md (deflated 46%)
+  adding: CHANGELOG.md (deflated 50%)
+  adding: Dockerfile (deflated 31%)
+  adding: Dockerfile.create_conda_env (deflated 40%)
+  adding: Dockerfile.create_conda_env.dev-pyspark (deflated 51%)
+  adding: Dockerfile.create_conda_env.seqrec (deflated 25%)
+  adding: Dockerfile.gitlab_ci (deflated 44%)
+  adding: Dockerfile.pack_conda_env (deflated 46%)
+  adding: Dockerfile.pack_conda_env.seqrec (deflated 38%)
+  adding: README.md (deflated 71%)
+  adding: __init__.py (stored 0%)
+  adding: __main__.py (deflated 63%)
+  adding: common/__init__.py (deflated 77%)
+  adding: common/clickhouse.py (deflated 67%)
+  adding: common/config.py (deflated 54%)
+  adding: common/date_utils.py (deflated 60%)
+  adding: common/log.py (deflated 67%)
+  adding: common/path_resolver.py (deflated 70%)
+  adding: common/readers.py (deflated 68%)
+  adding: conda_envs/Dockerfile (deflated 38%)
+  adding: conda_envs/dev.yml (deflated 30%)
+  adding: configs/__init__.py (stored 0%)
+  adding: configs/archive/MLDE-468-new/config.yaml (deflated 61%)
+  adding: configs/archive/MLDE-468-new/graph/graph.yaml (deflated 86%)
+  adding: configs/archive/MLDE-468-new/hydra/job_logging/custom.yaml (deflated 50%)
+  adding: configs/archive/MLDE-468-new/model/gnn.yaml (deflated 74%)
+  adding: configs/archive/MLDE-468-new/test/test.yaml (deflated 39%)
+  adding: configs/archive/MLDE-468-new/valid/valid.yaml (deflated 47%)
+  adding: configs/archive/MLDE-479-nbclean/config.yaml (deflated 66%)
+  adding: configs/archive/MLDE-479-nbclean/graph/graph.yaml (deflated 87%)
+  adding: configs/archive/MLDE-479-nbclean/hydra/job_logging/custom.yaml (deflated 50%)
+  adding: configs/archive/MLDE-479-nbclean/model/gnn.yaml (deflated 74%)
+  adding: configs/archive/MLDE-479-nbclean/test/test.yaml (deflated 39%)
+  adding: configs/archive/MLDE-479-nbclean/valid/valid.yaml (deflated 49%)
+  adding: configs/archive/README.md (deflated 45%)
+  adding: configs/archive/pre-MLDE-533/config.yaml (deflated 61%)
+  adding: configs/archive/pre-MLDE-533/graph/graph.yaml (deflated 85%)
+  adding: configs/archive/pre-MLDE-533/hydra/job_logging/custom.yaml (deflated 38%)
+  adding: configs/archive/pre-MLDE-533/model/gnn.yaml (deflated 70%)
+  adding: configs/archive/pre-MLDE-533/test/test.yaml (deflated 39%)
+  adding: configs/archive/pre-MLDE-533/valid/valid.yaml (deflated 47%)
+  adding: configs/config.yaml (deflated 66%)
+  adding: configs/graph/graph.yaml (deflated 87%)
+  adding: configs/gyml_online/gyml_online.yaml (deflated 40%)
+  adding: configs/hydra/job_logging/custom.yaml (deflated 50%)
+  adding: configs/model/gnn.yaml (deflated 74%)
+  adding: configs/test/test.yaml (deflated 39%)
+  adding: configs/valid/valid.yaml (deflated 49%)
+  adding: data/__init__.py (stored 0%)
+  adding: data/dataset.py (deflated 77%)
+  adding: data/graph.py (deflated 76%)
+  adding: data/pyspark_job/README.md (deflated 74%)
+  adding: data/pyspark_job/__init__.py (stored 0%)
+  adding: data/pyspark_job/config.py (deflated 78%)
+  adding: data/pyspark_job/configs/MLDE-468-new/edges.yaml (deflated 85%)
+  adding: data/pyspark_job/configs/MLDE-468-new/nodes.yaml (deflated 31%)
+  adding: data/pyspark_job/configs/MLDE-479-nbclean/edges.yaml (deflated 80%)
+  adding: data/pyspark_job/configs/MLDE-479-nbclean/nodes.yaml (deflated 31%)
+  adding: data/pyspark_job/configs/MLDE-479-nbopen/edges.yaml (deflated 79%)
+  adding: data/pyspark_job/configs/MLDE-479-nbopen/nodes.yaml (deflated 31%)
+  adding: data/pyspark_job/configs/README.md (deflated 50%)
+  adding: data/pyspark_job/configs/__init__.py (stored 0%)
+  adding: data/pyspark_job/configs/actual/__init__.py (stored 0%)
+  adding: data/pyspark_job/configs/actual/edges.yaml (deflated 80%)
+  adding: data/pyspark_job/configs/actual/nodes.yaml (deflated 31%)
+  adding: data/pyspark_job/edges.py (deflated 79%)
+  adding: data/pyspark_job/filters.py (deflated 81%)
+  adding: data/pyspark_job/gyml_online.py (deflated 75%)
+  adding: data/pyspark_job/nodes.py (deflated 82%)
+  adding: data/pyspark_job/segments.py (deflated 83%)
+  adding: data/pyspark_job/transforms.py (deflated 77%)
+  adding: environment-dev-pyspark.yml (deflated 40%)
+  adding: environment-feed-seqrec.yml (deflated 45%)
+  adding: environment.yml (deflated 55%)
+  adding: feed/__init__.py (stored 0%)
+  adding: feed/seqrec/__init__.py (stored 0%)
+  adding: feed/seqrec/feed_model.py (deflated 82%)
+  adding: feed/seqrec/pyspark_job/README.md (deflated 71%)
+  adding: feed/seqrec/pyspark_job/__init__.py (stored 0%)
+  adding: feed/seqrec/pyspark_job/common.py (deflated 75%)
+  adding: feed/seqrec/pyspark_job/post_inference_pyspark.py (deflated 66%)
+  adding: feed/seqrec/pyspark_job/post_text_encoder_pyspark.py (deflated 65%)
+  adding: feed/seqrec/pyspark_job/posts.py (deflated 78%)
+  adding: feed/seqrec/pyspark_job/posts_image_encoder_pyspark.py (deflated 64%)
+  adding: feed/seqrec/pyspark_job/user_inference_pyspark.py (deflated 66%)
+  adding: feed/seqrec/pyspark_job/users.py (deflated 82%)
+  adding: gyml-production-environment.json (deflated 74%)
+  adding: gyml/__init__.py (stored 0%)
+  adding: gyml/gnn/__init__.py (stored 0%)
+  adding: gyml/gnn/infra/__init__.py (stored 0%)
+  adding: gyml/gnn/infra/files.py (deflated 75%)
+  adding: gyml/gnn/infra/test/__init__.py (stored 0%)
+  adding: gyml/gnn/infra/test/conftest.py (stored 0%)
+  adding: gyml/gnn/infra/test/test_path_resolver.py (deflated 76%)
+  adding: gyml/gnn/ml_jobs/__init__.py (stored 0%)
+  adding: gyml/gnn/ml_jobs/adapters/__init__.py (stored 0%)
+  adding: gyml/gnn/ml_jobs/adapters/inference_app.py (deflated 47%)
+  adding: gyml/gnn/ml_jobs/adapters/post_inference.py (deflated 63%)
+  adding: gyml/gnn/ml_jobs/adapters/post_train.py (deflated 64%)
+  adding: gyml/gnn/ml_jobs/adapters/pre_train.py (deflated 65%)
+  adding: gyml/gnn/ml_jobs/adapters/train_app.py (deflated 57%)
+  adding: gyml/gnn/ml_jobs/adapters/train_config.py (deflated 59%)
+  adding: gyml/online/__init__.py (stored 0%)
+  adding: gyml/online/checkpoints.py (deflated 55%)
+  adding: gyml/online/dataset.py (deflated 70%)
+  adding: gyml/online/inference.py (deflated 63%)
+  adding: gyml/online/metadata.py (deflated 65%)
+  adding: gyml/online/ml_jobs/__init__.py (stored 0%)
+  adding: gyml/online/ml_jobs/adapters/__init__.py (stored 0%)
+  adding: gyml/online/ml_jobs/adapters/post_train.py (deflated 59%)
+  adding: gyml/online/ml_jobs/adapters/pre_train.py (deflated 58%)
+  adding: gyml/online/ml_jobs/adapters/train_app.py (deflated 53%)
+  adding: gyml/online/ml_jobs/adapters/train_config.py (deflated 64%)
+  adding: gyml/online/model.py (deflated 71%)
+  adding: gyml/online/path_resolver.py (deflated 74%)
+  adding: gyml/online/train.py (deflated 72%)
+  adding: gyml/online/transforms.py (deflated 65%)
+  adding: gyml_online/README.md (deflated 66%)
+  adding: gyml_online/__init__.py (deflated 7%)
+  adding: gyml_online/notebook_migration/AGENTS.md (deflated 43%)
+  adding: gyml_online/notebook_migration/prepare_dataset.py (deflated 74%)
+  adding: gyml_online/notebook_migration/tests/test_prepare_dataset.py (deflated 71%)
+  adding: gyml_online/notebook_migration/tests/test_train.py (deflated 64%)
+  adding: gyml_online/notebook_migration/train.py (deflated 72%)
+  adding: historical_inference.py (deflated 61%)
+  adding: inference/__init__.py (stored 0%)
+  adding: inference/inference.py (deflated 75%)
+  adding: inference/pyspark_job/__init__.py (deflated 13%)
+  adding: inference/pyspark_job/config.py (deflated 74%)
+  adding: inference/pyspark_job/data.py (deflated 81%)
+  adding: inference/pyspark_job/job.py (deflated 73%)
+  adding: inference/pyspark_job/samplers.py (deflated 67%)
+  adding: inference/pyspark_job/test/__init__.py (deflated 60%)
+  adding: inference/pyspark_job/test/config/model_1_config.yaml (deflated 75%)
+  adding: inference/pyspark_job/test/config/model_2_config.yaml (deflated 76%)
+  adding: inference/pyspark_job/test/conftest.py (deflated 64%)
+  adding: inference/pyspark_job/test/debug.py (deflated 38%)
+  adding: inference/pyspark_job/test/test_attributes.py (deflated 79%)
+  adding: inference/pyspark_job/test/test_basics.py (deflated 77%)
+  adding: inference/pyspark_job/test/test_graph_builder.py (deflated 77%)
+  adding: loggers/__init__.py (stored 0%)
+  adding: loggers/logger_mixins.py (deflated 72%)
+  adding: meta-config/DESIGN.md (deflated 61%)
+  adding: metrics/__init__.py (stored 0%)
+  adding: metrics/metrics.py (deflated 69%)
+  adding: metrics/utils.py (deflated 80%)
+  adding: models/__init__.py (stored 0%)
+  adding: models/gnn.py (deflated 79%)
+  adding: models/layers.py (deflated 69%)
+  adding: optimization/__init__.py (stored 0%)
+  adding: optimization/losses.py (deflated 74%)
+  adding: optimization/optimizers.py (deflated 74%)
+  adding: package-version.txt (stored 0%)
+  adding: pyproject.toml (deflated 56%)
+  adding: pyspark_runner.py (deflated 74%)
+  adding: pytest.ini (deflated 16%)
+  adding: scripts/__init__.py (stored 0%)
+  adding: scripts/fs_ops.py (deflated 65%)
+  adding: scripts/s3_utils.py (deflated 70%)
+  adding: scripts/utils.py (deflated 72%)
+  adding: test.py (deflated 64%)
+  adding: test_new.py (deflated 71%)
+  adding: tests/__init__.py (stored 0%)
+  adding: tests/configs/gnn_test_config.yml (deflated 64%)
+  adding: tests/configs/gnn_test_inference_config.yml (deflated 63%)
+  adding: tests/conftest.py (deflated 53%)
+  adding: tests/test_common_clickhouse.py (deflated 70%)
+  adding: tests/test_common_date_utils.py (deflated 76%)
+  adding: tests/test_common_path_resolver.py (deflated 78%)
+  adding: tests/test_common_readers.py (deflated 73%)
+  adding: tests/test_data_pyspark_job_config.py (deflated 76%)
+  adding: tests/test_data_pyspark_job_edges.py (deflated 74%)
+  adding: tests/test_data_pyspark_job_filters.py (deflated 82%)
+  adding: tests/test_data_pyspark_job_nodes.py (deflated 82%)
+  adding: tests/test_data_pyspark_job_segments.py (deflated 76%)
+  adding: tests/test_data_pyspark_job_transforms.py (deflated 79%)
+  adding: tests/test_feed_seqrec_feed_model.py (deflated 52%)
+  adding: tests/test_feed_seqrec_jobs.py (deflated 82%)
+  adding: tests/test_filters_transforms_package_config.py (deflated 63%)
+  adding: tests/test_fs_ops_package_resources.py (deflated 65%)
+  adding: tests/test_gnn.py (deflated 83%)
+  adding: tests/test_gyml_online_checkpoint_selection.py (deflated 71%)
+  adding: tests/test_gyml_online_inference.py (deflated 70%)
+  adding: tests/test_gyml_online_prepare_dataset.py (deflated 71%)
+  adding: tests/test_gyml_online_service_artifacts.py (deflated 69%)
+  adding: tests/test_gyml_online_train.py (deflated 72%)
+  adding: tests/test_inference.py (deflated 84%)
+  adding: tests/test_inference_jobs.py (deflated 65%)
+  adding: tests/test_inference_package_config.py (deflated 65%)
+  adding: tests/test_nodes_package_config.py (deflated 61%)
+  adding: tests/test_post_inference.py (deflated 65%)
+  adding: tests/test_pyspark_runner.py (deflated 54%)
+  adding: tests/test_train_config_smoke.py (deflated 66%)
+  adding: tests/test_train_inference_deployment.py (deflated 71%)
+  adding: tests/test_train_wrapper.py (deflated 68%)
+  adding: tests/utils.py (deflated 43%)
+  adding: train.py (deflated 63%)
+  adding: uv.lock (deflated 70%)
++ aws s3 cp ml_package_files.zip s3://gameram-jobs/data/ml/package/v3.1.0-dev/
+upload: ./ml_package_files.zip to s3://gameram-jobs/data/ml/package/v3.1.0-dev/ml_package_files.zip
++ export INDEX_ID=MLDE-479-nbclean
++ INDEX_ID=MLDE-479-nbclean
++ export INDEX_ID_ONLINE=261111
++ INDEX_ID_ONLINE=261111
++ export MODEL_S3_SUFFIX=MLDE-479-nbclean-261111
++ MODEL_S3_SUFFIX=MLDE-479-nbclean-261111
++ export MODEL_S3_DIR=s3://gameram-data/gyml/gyml-online/train/MLDE-479-nbclean-261111/model/
++ MODEL_S3_DIR=s3://gameram-data/gyml/gyml-online/train/MLDE-479-nbclean-261111/model/
++ pushd /home/vlk/data/gitlab/gameram/data/gyml_online
+~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/ml ~/data/gitlab/gameram/data/gyml_online
++ ml_package_path=/home/vlk/data/gitlab/gameram/data/ml/ml_package_files.zip
++ export PYTHONPATH=/home/vlk/data/gitlab/gameram/data/ml/ml_package_files.zip
++ PYTHONPATH=/home/vlk/data/gitlab/gameram/data/ml/ml_package_files.zip
++ uv sync --dev --locked
+Resolved 52 packages in 1ms
+Checked 51 packages in 0.42ms
++ uv run --locked python .ci/create_synthetic_model.py /home/vlk/data/gitlab/gameram/data/gyml_online/app
+Synthetic model created in /home/vlk/data/gitlab/gameram/data/gyml_online/app/model
++ aws s3 cp /home/vlk/data/gitlab/gameram/data/gyml_online/app/model/metadata.yaml s3://gameram-data/gyml/gyml-online/train/MLDE-479-nbclean-261111/model/
+upload: app/model/metadata.yaml to s3://gameram-data/gyml/gyml-online/train/MLDE-479-nbclean-261111/model/metadata.yaml
++ aws s3 cp /home/vlk/data/gitlab/gameram/data/gyml_online/app/model/model_state.pth s3://gameram-data/gyml/gyml-online/train/MLDE-479-nbclean-261111/model/
+upload: app/model/model_state.pth to s3://gameram-data/gyml/gyml-online/train/MLDE-479-nbclean-261111/model/model_state.pth
++ pushd /home/vlk/data/gitlab/gameram/data/gyml_online
+~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/ml ~/data/gitlab/gameram/data/gyml_online
++ export BUILD_ENV_NAME=develop
++ BUILD_ENV_NAME=develop
++ export DOCKER_ENV_CI=false
++ DOCKER_ENV_CI=false
++ export AWS_DEFAULT_REGION=us-east-1
++ AWS_DEFAULT_REGION=us-east-1
++ bash .ci/app_pytest.sh
++ tee /tmp/gyml-online-app-tests.log
++++ dirname .ci/app_pytest.sh
+++ cd .ci
+++ pwd
++ __dir=/home/vlk/data/gitlab/gameram/data/gyml_online/.ci
++ pushd /home/vlk/data/gitlab/gameram/data/gyml_online/.ci/..
+~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/gyml_online
+++ yq .components.image_base_version versions.yaml
++ export GYML_ONLINE_BASE_VERSION=base-0.1.0
++ GYML_ONLINE_BASE_VERSION=base-0.1.0
++ export GYML_ONLINE_BASE_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service
++ GYML_ONLINE_BASE_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service
++ export DOCKER_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0
++ DOCKER_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0
++ aws ecr get-login-password --region us-east-1
++ docker login --username AWS --password-stdin 405263509977.dkr.ecr.us-east-1.amazonaws.com
+
+WARNING! Your credentials are stored unencrypted in '/home/vlk/.docker/config.json'.
+Configure a credential helper to remove this warning. See
+https://docs.docker.com/go/credential-store/
+
+Login Succeeded
+++ pwd
++ bash ./.ci/prepare_artifacts.sh /home/vlk/data/gitlab/gameram/data/gyml_online/app
+++ pwd
++ docker run --rm --workdir /app --mount type=bind,src=/home/vlk/data/gitlab/gameram/data/gyml_online/app,dst=/app --env PYTHONPATH=/app/ml/ml_package_files.zip --publish 8000:8000 --platform=linux/amd64 405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0 bash -euc '/opt/conda/envs/gyml_online/bin/pip install pytest==8.4.2
+ /opt/conda/envs/gyml_online/bin/python -B -m pytest'
+Unable to find image '405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0' locally
+base-0.1.0: Pulling from gyml-online-service
+79897cfc1898: Pulling fs layer
+6f5f2d96c480: Pulling fs layer
+1f918cd33fa9: Pulling fs layer
+cc13bf9cfc78: Pulling fs layer
+5959ed260e23: Download complete
+6f5f2d96c480: Download complete
+cc13bf9cfc78: Download complete
+79897cfc1898: Download complete
+6f5f2d96c480: Pull complete
+79897cfc1898: Pull complete
+1f918cd33fa9: Download complete
+1f918cd33fa9: Pull complete
+cc13bf9cfc78: Pull complete
+Digest: sha256:7d99878dcea5d448c959dc5e197904d6849af815731d22d46cb9ffa06fff8a88
+Status: Downloaded newer image for 405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0
+Collecting pytest==8.4.2
+  Downloading pytest-8.4.2-py3-none-any.whl.metadata (7.7 kB)
+Requirement already satisfied: exceptiongroup>=1 in /opt/conda/envs/gyml_online/lib/python3.9/site-packages (from pytest==8.4.2) (1.3.0)
+Collecting iniconfig>=1 (from pytest==8.4.2)
+  Downloading iniconfig-2.1.0-py3-none-any.whl.metadata (2.7 kB)
+Collecting packaging>=20 (from pytest==8.4.2)
+  Downloading packaging-26.3-py3-none-any.whl.metadata (3.5 kB)
+Collecting pluggy<2,>=1.5 (from pytest==8.4.2)
+  Downloading pluggy-1.6.0-py3-none-any.whl.metadata (4.8 kB)
+Requirement already satisfied: pygments>=2.7.2 in /opt/conda/envs/gyml_online/lib/python3.9/site-packages (from pytest==8.4.2) (2.19.2)
+Requirement already satisfied: tomli>=1 in /opt/conda/envs/gyml_online/lib/python3.9/site-packages (from pytest==8.4.2) (2.3.0)
+Requirement already satisfied: typing-extensions>=4.6.0 in /opt/conda/envs/gyml_online/lib/python3.9/site-packages (from exceptiongroup>=1->pytest==8.4.2) (4.15.0)
+Downloading pytest-8.4.2-py3-none-any.whl (365 kB)
+Downloading iniconfig-2.1.0-py3-none-any.whl (6.0 kB)
+Downloading packaging-26.3-py3-none-any.whl (129 kB)
+Downloading pluggy-1.6.0-py3-none-any.whl (20 kB)
+Installing collected packages: pluggy, packaging, iniconfig, pytest
+Successfully installed iniconfig-2.1.0 packaging-26.3 pluggy-1.6.0 pytest-8.4.2
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable.It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+============================= test session starts ==============================
+platform linux -- Python 3.9.0, pytest-8.4.2, pluggy-1.6.0
+rootdir: /app
+plugins: anyio-4.11.0
+collected 5 items
+
+tests/test_endpoints.py .....                                            [100%]
+
+============================== 5 passed in 0.98s ===============================
++ bash .ci/build_service_image.sh no-push
++ tee /tmp/gyml-online-image-tests.log
++++ dirname .ci/build_service_image.sh
+++ cd .ci
+++ pwd
++ __dir=/home/vlk/data/gitlab/gameram/data/gyml_online/.ci
++ pushd /home/vlk/data/gitlab/gameram/data/gyml_online/.ci/..
+~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/gyml_online
++ export ENV_NAME=develop
++ ENV_NAME=develop
++ [[ develop == \d\e\v\e\l\o\p ]]
+++ yq .components.image_service_version versions.yaml
++ export GYML_ONLINE_SERVICE_VERSION=0.1.13-dev
++ GYML_ONLINE_SERVICE_VERSION=0.1.13-dev
++ aws ecr get-login-password --region us-east-1
++ docker login --username AWS --password-stdin 405263509977.dkr.ecr.us-east-1.amazonaws.com
+
+WARNING! Your credentials are stored unencrypted in '/home/vlk/.docker/config.json'.
+Configure a credential helper to remove this warning. See
+https://docs.docker.com/go/credential-store/
+
+Login Succeeded
++ export ECR_REPO_SHORTNAME=gyml-online-service
++ ECR_REPO_SHORTNAME=gyml-online-service
++ export ECR_REPO_NAME=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service
++ ECR_REPO_NAME=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service
++ export ECR_IMAGE_TAG=service-0.1.13-dev
++ ECR_IMAGE_TAG=service-0.1.13-dev
++ export ECR_DOCKER_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:service-0.1.13-dev
++ ECR_DOCKER_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:service-0.1.13-dev
+++ aws ecr describe-images --repository-name=gyml-online-service --image-ids=imageTag=service-0.1.13-dev
+
+aws: [ERROR]: An error occurred (ImageNotFoundException) when calling the DescribeImages operation: The image with imageId {imageDigest:'null', imageTag:'service-0.1.13-dev'} does not exist within the repository with name 'gyml-online-service' in the registry with id '405263509977'
++ export IMAGE_META=
++ IMAGE_META=
+++ echo
+++ jq -r '.imageDetails[0].imageTags[0]'
++ export IMAGE_TAGS=
++ IMAGE_TAGS=
++ [[ develop == \p\r\o\d ]]
++ rm -rf ./service/tmp
++ pushd ./app
+~/data/gitlab/gameram/data/gyml_online/app ~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/gyml_online
++ rsync -avz --ignore-missing-args --files-from=- . ../service/tmp/
++ git ls-files
+building file list ... done
+created directory ../service/tmp
+config/
+config/logging.yaml
+model/
+model/.gitkeep
+service/
+service/__init__.py
+service/main.py
+service/settings.py
+tests/
+tests/test_endpoints.py
+
+sent 4,711 bytes  received 179 bytes  9,780.00 bytes/sec
+total size is 11,961  speedup is 2.45
++ rm -rvf ../service/tmp/tests
+removed '../service/tmp/tests/test_endpoints.py'
+removed directory '../service/tmp/tests'
++ popd
+~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/gyml_online
+++ pwd
++ bash ./.ci/prepare_artifacts.sh /home/vlk/data/gitlab/gameram/data/gyml_online/service/tmp
++ export GYML_ONLINE_BASE_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service
++ GYML_ONLINE_BASE_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service
+++ yq .components.image_base_version versions.yaml
++ export GYML_ONLINE_BASE_VERSION=base-0.1.0
++ GYML_ONLINE_BASE_VERSION=base-0.1.0
++ export LOCAL_DOCKER_IMAGE=local/gyml_online_service:0.1.13-dev
++ LOCAL_DOCKER_IMAGE=local/gyml_online_service:0.1.13-dev
++ pushd ./service
+~/data/gitlab/gameram/data/gyml_online/service ~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/gyml_online
++ docker buildx build --platform linux/amd64 --load --build-arg GYML_ONLINE_BASE_IMAGE=405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service --build-arg GYML_ONLINE_BASE_VERSION=base-0.1.0 -f Dockerfile.gyml_online_service -t local/gyml_online_service:0.1.13-dev .
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.gyml_online_service
+#1 transferring dockerfile: 1.05kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for 405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [internal] load build context
+#4 transferring context: 533.52kB done
+#4 DONE 0.0s
+
+#5 [1/3] FROM 405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0@sha256:7d99878dcea5d448c959dc5e197904d6849af815731d22d46cb9ffa06fff8a88
+#5 resolve 405263509977.dkr.ecr.us-east-1.amazonaws.com/gyml-online-service:base-0.1.0@sha256:7d99878dcea5d448c959dc5e197904d6849af815731d22d46cb9ffa06fff8a88 0.0s done
+#5 DONE 0.1s
+
+#6 [2/3] WORKDIR /app
+#6 DONE 0.0s
+
+#7 [3/3] COPY ./tmp /app
+#7 DONE 0.0s
+
+#8 exporting to image
+#8 exporting layers 0.1s done
+#8 exporting manifest sha256:1f34fad418151335aae29fb485b614b91df46cb158d8859ca5eb9bd465ca7d13 done
+#8 exporting config sha256:72cea532d9d1f10a0b93d439f20a751ee1c188cf76a3dbc7b6e7ddc915d0a5d2
+#8 exporting config sha256:72cea532d9d1f10a0b93d439f20a751ee1c188cf76a3dbc7b6e7ddc915d0a5d2 done
+#8 exporting attestation manifest sha256:be08b7465d54350f66dfcdd1db033eed6aa72f66bd41c01f234581d02b80653b 0.0s done
+#8 exporting manifest list sha256:052877935e38331bbb937c48f39a2b2198a8884af9e1749fe6b5d42b7e17f18e done
+#8 naming to docker.io/local/gyml_online_service:0.1.13-dev done
+#8 unpacking to docker.io/local/gyml_online_service:0.1.13-dev 0.0s done
+#8 DONE 0.2s
++ popd
+~/data/gitlab/gameram/data/gyml_online ~/data/gitlab/gameram/data/gyml_online
++ rm -rvf ./service/tmp
+removed './service/tmp/versions.yaml'
+removed './service/tmp/config/logging.yaml'
+removed directory './service/tmp/config'
+removed './service/tmp/model/.gitkeep'
+removed './service/tmp/model/metadata.yaml'
+removed './service/tmp/model/model_state.pth'
+removed directory './service/tmp/model'
+removed './service/tmp/service/settings.py'
+removed './service/tmp/service/__init__.py'
+removed './service/tmp/service/main.py'
+removed directory './service/tmp/service'
+removed './service/tmp/ml/ml_package_files.zip'
+removed directory './service/tmp/ml'
+removed directory './service/tmp'
++ echo 'Docker image local/gyml_online_service:0.1.13-dev built successfully, start testing'
+Docker image local/gyml_online_service:0.1.13-dev built successfully, start testing
++ export CONTAINER_NAME=gyml_online_service-test_container
++ CONTAINER_NAME=gyml_online_service-test_container
++ export SERVICE_PORT=8080
++ SERVICE_PORT=8080
++ export SERVICE_HOSTNAME=localhost
++ SERVICE_HOSTNAME=localhost
++ [[ false == \t\r\u\e ]]
++ docker run --name gyml_online_service-test_container -d --publish 8080:8080 --platform=linux/amd64 local/gyml_online_service:0.1.13-dev --port 8080 --workers 1
+8d6ce9aba3f9dd816804b3d1c9b12dd6cab8fbcc9cceda57d28caf278384f653
++ sleep 7
+++ curl -v --retry 7 --max-time 3 -H 'accept: application/json' -X GET http://localhost:8080/version
+++ jq -r .gyml_online_version
+Note: Unnecessary use of -X or --request, GET is already inferred.
+* Host localhost:8080 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0*   Trying [::1]:8080...
+* Connected to localhost (::1) port 8080
+> GET /version HTTP/1.1
+> Host: localhost:8080
+> User-Agent: curl/8.5.0
+> accept: application/json
+>
+< HTTP/1.1 200 OK
+< date: Wed, 18 Nov 2026 10:46:19 GMT
+< server: uvicorn
+< content-length: 249
+< content-type: application/json
+<
+{ [249 bytes data]
+100   249  100   249    0     0  36714      0 --:--:-- --:--:-- --:--:-- 41500
+* Connection #0 to host localhost left intact
+++ yq .gyml_online_version versions.yaml
++ test 0.1.13 = 0.1.13
+++ curl -fs --max-time 3 -H 'accept: application/json' -X GET http://localhost:8080/health
+++ jq -r .status
++ test ready = ready
++ export 'REQ_BODY={"account_id": 42, "features": {
+    "region": "foo",
+    "language": "bar",
+    "has_about": 1,
+    "has_link": 0,
+    "has_name": 1,
+    "has_nickname": 0,
+    "has_avatar": 1,
+    "platforms": ["pc"],
+    "games": [11]
+}}'
++ REQ_BODY='{"account_id": 42, "features": {
+    "region": "foo",
+    "language": "bar",
+    "has_about": 1,
+    "has_link": 0,
+    "has_name": 1,
+    "has_nickname": 0,
+    "has_avatar": 1,
+    "platforms": ["pc"],
+    "games": [11]
+}}'
+++ curl -fs --max-time 3 -H 'accept: application/json' -H 'Content-Type: application/json' -X POST http://localhost:8080/api/v1/inference -d '{"account_id": 42, "features": {
+    "region": "foo",
+    "language": "bar",
+    "has_about": 1,
+    "has_link": 0,
+    "has_name": 1,
+    "has_nickname": 0,
+    "has_avatar": 1,
+    "platforms": ["pc"],
+    "games": [11]
+}}'
++ inference_response='{"embedding":[-0.2435871809720993,-0.4425421953201294,0.745352029800415,0.20674970746040344,0.3026205897331238,-0.21878325939178467,0.16811911761760712,-0.7398636341094971,0.023681242018938065,-0.5614786148071289,0.27429667115211487,-0.0697297528386116,0.5913821458816528,-0.3315468430519104,-0.35701772570610046,0.613410234451294,-0.0021136105060577393,0.27386802434921265,0.113421730697155,0.41284850239753723,-0.3417178690433502,0.7785918712615967,-0.48310524225234985,0.04056261479854584,-0.1736575812101364,-0.49821338057518005,-0.38548755645751953,0.16566741466522217,-1.0335807800292969,0.28158897161483765,0.19315460324287415,-0.37576544284820557,-0.053103432059288025,0.45720914006233215,-0.2346712350845337,-0.1536400020122528,-0.3907187581062317,0.20930396020412445,0.3147265613079071,-0.4946991801261902,-0.03226172551512718,-0.10444875061511993,-0.31538155674934387,0.0006070435047149658,0.304640531539917,-0.15744194388389587,-0.116808220744133,0.2816973328590393,-0.3972581624984741,0.3499927520751953,0.04743417352437973,-0.11014095693826675,0.18250592052936554,0.12990234792232513,0.231345996260643,0.001196637749671936,-0.3944046199321747,0.523924708366394,0.07611124217510223,-0.18955504894256592,-0.2818954288959503,-0.2485678493976593,0.3516330122947693,0.2705116271972656],"metadata":{"vector_size":64}}'
++ jq -e '.metadata.vector_size == 64 and (.embedding | length == 64) and all(.embedding[]; type == "number")'
+true
++ docker container stop -t 5 gyml_online_service-test_container
+gyml_online_service-test_container
++ docker container rm -fv gyml_online_service-test_container
+gyml_online_service-test_container
++ echo 'Docker image local/gyml_online_service:0.1.13-dev tested successfully, ready for push'
+Docker image local/gyml_online_service:0.1.13-dev tested successfully, ready for push
++ [[ no-push == \n\o\-\p\u\s\h ]]
++ echo 'No-push argument given, skipping docker image push to ECR'
+No-push argument given, skipping docker image push to ECR
++ exit 0
+'''
+
+
+A:
+
+• The Docker integration test passed. All **5 endpoint tests** passed in the Conda base image, including the check that inference was imported from the ML ZIP. The built service image reported version `0.1.13`, returned `ready` from `/health`, and produced a 64-element numeric embedding. The ECR `ImageNotFoundException` did not affect the develop build, which exited `0` without pushing the image.
+
+One thing to resolve before running training: the test uploaded synthetic weights and metadata to the regular `MLDE-479-nbclean-261111` model prefix. Training for that same version will refuse to write to the nonempty destination, and a build pointed there will pick up the synthetic model. The run also uploaded the locally built ZIP to the shared `v3.1.0-dev` key, so other builds pinned to that key can pick up this checkout’s package. I’d use a dedicated test prefix for future synthetic runs.
+
+
+Q:
+
+› Yes, valid point. dev zip is no problem at all, but I have to remove synthetic model from S3.
+
+
+A:
+
+• The two synthetic objects are under `s3://gameram-data/gyml/gyml-online/train/MLDE-479-nbclean-261111/model/`: `metadata.yaml` and `model_state.pth`.
+
+Before deleting them, confirm the current `metadata.yaml` still says `synthetic: true` in case a training run has since replaced the artifacts. Delete the two objects by exact key, then verify that the model prefix is empty before training.
+
+
+Q:
+
+› OK, now we can start working on deploy stage in airflow dag. I believe we have some unresolved questions?
+
+
+A:
+
+• I’ll check the design notes, the DAG’s deploy placeholder, and the GitLab and ECS scripts to see which decisions are still open.
+
+• Yes. The deploy stage is still a placeholder. The main open decisions are **which GitLab pipeline to trigger, how to identify the image, and what counts as a successful rollout**.
+
+1. **GitLab trigger and release ref.** I’d reuse the ALS trigger-and-wait helper and route `SUBPROJECT=gyml_online` to the service child pipeline. Airflow would send `BUILD_ENV_NAME`, `SPLIT`, `INDEX_ID`, and `INDEX_ID_ONLINE`. Both Airflow-triggered environments should deploy automatically and fail the child pipeline if deployment fails. Today the root pipeline rejects API triggers for this component, and develop deployment is manual and allowed to fail. We also need a new service tag after the CI changes land. The existing `gyml-online-v0.1.13` tag predates the artifact loader. [Root CI](/workspace/data/.gitlab-ci.yml:74) · [Service CI](/workspace/data/gyml_online/.gitlab-ci.yml)
+
+2. **ECS target and image identity.** The existing cluster mapping is `develop` → `gameram-fargate-develop` and `prod` → `gapp-prod`. I’d map `control` to `gyml-online-service` and `treatment` to `gyml-online-treatment-service`. Today the script gets one fixed service name from `versions.yaml`, and the ECR tag identifies only the service version and environment. We need to decide whether the same service release can deploy multiple model versions and what happens on a rerun. My recommendation is to include the model ID in the image tag and reuse an already published image when its identity matches. [ECS script](/workspace/data/gyml_online/.ci/update_ecs_service.sh) · [Image build](/workspace/data/gyml_online/.ci/build_service_image.sh)
+
+3. **Artifact validation.** A deploy-only run can use the existing S3 artifacts for the configured `INDEX_ID` and `INDEX_ID_ONLINE`. The path already works without `run_dth`. The service Git tag continues to pin its inference ZIP through `versions.yaml`. I’d have CI verify the model IDs in metadata, reject synthetic artifacts, and keep the image smoke test. The remaining policy choice is whether training and inference package versions must match exactly or whether we allow explicitly approved combinations. [Artifact preparation](/workspace/data/gyml_online/.ci/prepare_artifacts.sh) · [Training metadata](/workspace/data/ml/gyml/online/metadata.py)
+
+4. **Rollout success.** Today the script checks that ECS accepted the task definition. I’d have it wait for the service to stabilize and verify it’s running the requested revision, so a rollback cannot produce a successful Airflow run. The ECS task definition already checks `/health` for `ready`. [ECS script](/workspace/data/gyml_online/.ci/update_ecs_service.sh) · [ECS health check](/workspace/data/gyml_online/.aws/task-definition-prod.json:58)
+
+I’d start with GitLab routing and variable forwarding, then settle image identity and rollout behavior before wiring the Airflow task group.
+
+
+Q:
+
+› Gitlab trigger and release ref: yes, following reference implementation from ALS is what I want. ECS target and image identity: cluster and service name mappings looks good, but for develop we don't have treatment split, only one service in develop cluster. Service release always replace old with new, except the case when prod docker image already exists in ECR. So, on rerun dev recreate service, and prod fails. This bring image identity: we should change current versioning schema to this: image version (tag) consists of 'image_service_version', 'index_id', 'index_id_online'. In this order. By the way, 'service_name' now defined by 'build_env_name' and 'split' parameters. Artifact validation: sound good, only one note: ml package version for train and inference could be two different versions; maybe later we add check for major version number. Rollout success: ok, lets try change acceptance to werification of requested revision. OK?
+
+
+A:
+
+• I’ll implement the agreed contract across GitLab, ECS, and Airflow. Develop will use one service, prod will select by split, and CI will verify that ECS stabilized on the requested revision. I’ll keep training and inference package versions independent.
+
+• The DAG now sends the release inputs to GitLab and waits for the pipeline result. CI rejects synthetic metadata for publishing, and the ECS script checks the requested revision after stabilization. I used `gyml-online-v0.2.0` as the release ref, matching the current service version and tag convention. That tag still needs to be created.
+
+• Implemented `gyml_online_train`’s deploy stage using the ALS GitLab trigger-and-wait pattern. Airflow now waits for CI to publish the image and verify that ECS has stabilized on the requested task definition revision.
+
+- **Develop** uses one `gyml-online-service`. A rerun replaces the image and rolls out fresh tasks on that service.
+- **Prod** selects the ECS service by split and fails if the image tag already exists.
+- **Image tags** use `service-<image_service_version>-<index_id>-<index_id_online>`, with `-dev` appended for develop so both environments can share the ECR repository.
+- **Artifact validation** checks the model IDs and rejects synthetic artifacts before publishing. Training and inference ML package versions can differ.
+
+All 8 DAG tests and 10 artifact tests passed. The live GitLab and ECS rollout is still unverified. The DAG points to `gyml-online-v0.2.0`, which needs to be published from a commit containing these CI changes before the first deploy run.
+
+
+Q:
+
+› Great! Thanks, now I'll review changes
+
+
+A:
+
+• Sounds good. I’ll wait for your review.
+
+
+Q:
+
+› Why do we need 'resource_group: gyml-online-deploy' in '''gyml_online/:
+  gitlab-ci:
+    yml:105:'''?
+
+
+A:
+
+• I’ll check the GitLab behavior behind that setting and explain what it protects in this deploy job.
+
+• `resource_group: gyml-online-deploy` makes GitLab run only one `deploy-service` job at a time across pipelines. I added it because Airflow-triggered deploys and regular GitLab deploys can overlap even with `max_active_runs=1` in Airflow. [GitLab resource groups](https://docs.gitlab.com/ci/resource_groups/)
+
+It protects two operations:
+
+- **ECR publishing.** Two prod jobs could both check that the same tag is absent before either pushes it.
+- **ECS rollout.** A second job could update the same service while the first is waiting for its requested revision to stabilize.
+
+The tradeoff is that one shared group also queues independent deploys, such as develop and prod. It’s a conservative concurrency safeguard. If we can guarantee those jobs are already serialized elsewhere, it’s redundant.
+
+
+Q:
+
+› Got it, thanks.
+
+
+A:
+
+• You’re welcome.
+
+
+Q:
+
+› OK, I made some minor fixes. Approved, commited. Now we should test it E2E I suppose?
+
+
+A:
+
+• Yes. I’ll check the committed release settings and local test prerequisites so we can start with a develop deploy-only run and then exercise the full DAG.
+
+• Yes. The committed changes passed all **18 local DAG and artifact tests**. The next test should run through Airflow, GitLab, and ECS in **develop** with a real trained model.
+
+1. Confirm `gyml-online-v0.2.0` points to commit `658e0b2b` or a later commit containing the deploy changes, and that the updated DAG is loaded in Airflow. The tag is absent locally, and SSH host verification blocked the remote check.
+2. If `MLDE-479-nbclean-261111` already has real `model_state.pth` and `metadata.yaml` in S3, start with `stages=["deploy"]`. If that prefix is empty after synthetic cleanup, run `["data_collect", "train", "deploy"]` with a `run_dth` whose input partitions are ready.
+3. Verify that Airflow succeeds, ECS rolls out the requested revision, `/version` reports the expected model ID, and an inference request returns 64 values.
+
+If you start with deploy-only, use a fresh `index_id_online` for the subsequent full run. Training requires an empty model output prefix.
+
+
+Q:
+
+› While I'm checking our AF DAG, you can start with preliminary code review, saving findings for later in the md file 'data/MLDE-654-review.md'
+
+
+A:
+
+• I’ll review the feature branch against `develop`, starting with the changed components and tracing the handoffs between Airflow, ML artifacts, GitLab, and ECS. I’ll save the findings in `MLDE-654-review.md` at the repository root.
+
+• I found a few failure paths the happy-path tests don’t cover, including a training retry that can reuse a partial input download and a synthetic test that can fail after its checks pass. I’ll verify the ML cases locally and keep the E2E prerequisites separate in the review.
+
+• Saved eight preliminary findings in [MLDE-654-review.md](/workspace/data/MLDE-654-review.md), reviewing the feature branch against `develop`.
+
+The highest-priority finding is a reproduced training retry bug: after an interrupted S3 download, the next run can silently train on an incomplete local cache. The report also covers partial model uploads, game vocabulary edge cases, and deployment timeout behavior.
+
+**104 local tests passed** across Airflow, Spark, ML, and artifact handling. The live E2E run remains separate. Only the review file was added.
+
+
+Q:
+
+› Good, I agree, those are all valid findings. Any other findings, according to our code review principles?
+
+
+A:
+
+• I’ll make a second pass over correctness, test coverage, modularity, and performance. I’ll add any new findings to the same review file and distinguish them from the behavior we intentionally preserved.
+
+
+Q:
+
+› don't forget about DRY, KISS, and SOLID principles
+
+
+A:
+
+• I’ll evaluate those explicitly. The shared release settings already centralize image naming and ECS target selection. I’ll check where the remaining interfaces allow inconsistent settings or duplicate work, and tie each note to a concrete consequence.
+
+• Added four findings and two design follow-ups to the [review file](/workspace/data/MLDE-654-review.md#9-p2-invalid-predictions-can-win-checkpoint-selection).
+
+- **Correctness and testability:** I reproduced NaN predictions scoring perfect recall, a rank-11 result counting as a recall@10 hit, and evaluation dropping partial batches. Validation also samples different examples for each checkpoint, which can affect the shortlist.
+- **Cross-component consistency:** CI jobs fetch the mutable `-dev` ZIP independently, so the endpoint suite can test different bytes from those in the deployed image. The deployed image still gets its own smoke test.
+- **DRY and SOLID:** Keep the shared EC2 lifecycle, but give GNN and online training small entry points that assemble their required settings together. Today a caller can choose the online wrapper without supplying its model version, and the error surfaces only on EC2.
+- **KISS and performance:** The batch generator loads three vocabularies and encodes `games_added` for each sample, even though batching discards that feature. Using only the selected vocabulary would simplify the path. The speed impact is unmeasured.
+
+I’d prioritize the recall calculation because it can select the wrong model while training and deployment both report success.
+
+
+Q:
+
+› OK, thanks. I agree with your findings. We will address them later, after I confirm that pipeline works as expected along happy path.
+
+
+A:
+
+• Sounds good. The findings are saved in the review file. Once you confirm the happy path, we can work through them in priority order.
+
+
+Q:
+
+› For now I need to add one more section to our design doc. In that section I need a brief overview of the pipeline design, as brief as possible. But it should contain all non-obvious decisions that I made, and all references to inputs and outputs used in pipeline, including git tag, S3 paths, etc. Required inputs, parameters, expected outputs. Like a cheat-sheet, OK?
+
+
+A:
+
+• I’ll check the DAG and job configs for the exact inputs, outputs, and version pins, then add a compact cheat sheet to the design doc.
+
+• Added a [pipeline cheat sheet](/workspace/data/MLDE-654-gyml-online-auto-design.md:12) near the top of the design doc. It lists the DAG parameters and defaults, current Git tag and ML package pins, and each stage’s required inputs and expected S3, ECR, and ECS outputs.
+
+It also captures the decisions most likely to matter during a run: the one-day event window shift, checkpoint selection, the empty model prefix requirement, and develop versus prod rerun behavior. All eight repository links were verified.
+
+
+Q:
+
+› As brief as possible, excellent job, thanks!
+
+
+A:
+
+• You’re welcome!
+
+
+Q:
+
+› Export today’s session, please
+
+
+A:
+
+• I’ll use the `export-session-dialog` skill to save today’s visible conversation as a Markdown transcript.
