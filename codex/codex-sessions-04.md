@@ -1620,3 +1620,158 @@ Q:
 A:
 
 • I’ll use the `export-session-dialog` skill to save today’s visible conversation as a Markdown transcript.
+
+## 2026-11-19 gyml-online
+
+Q:
+
+› Hi, where were we?
+
+
+A:
+
+• We were waiting for your **develop E2E check** of `gyml_online_train`: Airflow data collection and training, followed by GitLab deploying the trained model to ECS. The last status we had was **104 local tests passed**, with the live happy path still to confirm.
+
+The [design cheat sheet](/workspace/data/MLDE-654-gyml-online-auto-design.md:12) has the run parameters, Git tag, and artifact paths. We agreed to work through the [code review findings](/workspace/data/MLDE-654-review.md) after the happy path passes.
+
+
+Q:
+
+› OK, good. I've tested our pipeline E2E, it is working as expected. In the process I've made some changes and fixes. To be on the same page, take a look and give me a summary of those changes
+
+
+A:
+
+• I’ll compare the current branch with the last revision we reviewed and summarize what changed during E2E testing.
+
+• Compared the current branch (`7134b1f6`) with `658e0b2b`, the revision from our preliminary review. The E2E fixes were mainly in deploy and service startup. Data collection and model training code stayed the same.
+
+- **Airflow and GitLab.** The DAG now uses `gyml-online-0.2.0-dev`, which points to `7d32b81a` and includes the rollout fix. The DAG documents the protected `gyml-online-service-*` tag pattern for prod. The shared GitLab connection comment now names `gitlab.gameram.com`. [DAG](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py:22)
+- **Service startup.** FastAPI now uses `gyml_online_version` and a fixed title, removing startup dependencies on the deleted `api_version` and `service_name` keys. `versions.yaml` supplies `model_version: unknown` until artifact preparation fills in the actual model ID. [Service entry point](/workspace/data/gyml_online/app/service/main.py:192) · [Version config](/workspace/data/gyml_online/versions.yaml)
+- **ECS rollout.** After the standard stability waiter, the script polls every 10 seconds for up to five more minutes for the requested revision to reach `COMPLETED`. It now accepts an intentional desired count of zero and prints rollout details and recent events if ECS reports `FAILED`. [Rollout check](/workspace/data/gyml_online/.ci/update_ecs_service.sh:62)
+- **Docs and test instructions.** You added a stage-by-stage ML runbook, updated the service version example and design cheat sheet, and documented how to invoke the synthetic test. [ML runbook](/workspace/data/ml/README.md:239) · [Design cheat sheet](/workspace/data/MLDE-654-gyml-online-auto-design.md:12)
+
+
+Q:
+
+› Yes, exactly. Now I want to fix some minor issues that I noticed during E2E tests. Ready?
+
+
+A:
+
+• Ready. Send the first issue and we’ll work through them one at a time.
+
+
+Q:
+
+› We created directory 'ml/gyml_online/' and now there only frozen scripts and a readme. I suggest we move scripts and part of the readme (describing those scripts) to 'research/gyml/online/scripts/'; and part of the readme we should put to 'ml/gyml/online/README.md'. After that we should remove 'ml/gyml_online/'. OK?
+
+
+A:
+
+• I’ll move the frozen scripts, their tests, and their documentation into `research/gyml/online/scripts/`. I’ll put the automated pipeline docs next to `ml/gyml/online/` and update the references to both locations.
+
+• Both frozen scripts are byte-for-byte identical after the move. The smoke tests now sit outside `ml/`, so their documented commands explicitly select the ML pytest config. I’m rerunning those tests with the production parity suite.
+
+• Moved the frozen scripts, smoke tests, and reference docs to [research/gyml/online/scripts](/workspace/data/research/gyml/online/scripts/README.md). The automated preparation, training, and inference docs now live in [ml/gyml/online/README.md](/workspace/data/ml/gyml/online/README.md). Updated the links and test imports, then removed `ml/gyml_online/`.
+
+Both frozen scripts are byte-for-byte identical. All **19 smoke and parity tests passed**. Py4J emitted a logging error during shutdown after the tests passed.
+
+
+Q:
+
+› OK, there is some leftovers. I see 'from research.gyml.online.scripts import train as reference' in test file, but 'research' is not a part of 'ml' and vice-versa. We should not link research to other projects, only links in docs allowed. So, I suggest we remove tests that need research. What do you think?
+
+
+A:
+
+• I agree. I’ll remove the cross-project test dependencies and keep the tests that exercise the automated pipeline using only `ml` code and fixtures. The frozen scripts and documentation links will stay in research.
+
+• Removed the ML parity tests that imported research code and retired the frozen scripts’ smoke tests. The ML test suite now runs independently of `research/`. All **55 focused tests passed**.
+
+The frozen scripts still use the existing ML S3 helpers when run manually. Removing that dependency would require changing the frozen scripts themselves.
+
+
+Q:
+
+› Perfect, thanks! Now, in AF DAG 'gyml_gnn_train' we have task-group that check if input tables and events are ready, but in our 'gyml_online_train' dag we miss that. Please, add required task-group to our DAG
+
+
+A:
+
+• I’ll compare the GNN readiness group with the online job’s source paths, then add checks for the inputs `gyml_online_train` actually reads.
+
+• The Spark job uses the original `run_dth` hour for the four Postgres snapshots and the `gyml-sent-event` schema. Its event history ends one day earlier. I’ll check both hours inside `data_collect`, so train-only and deploy-only runs can still skip collection. Like the GNN group, this will check the end of the event window while preserving the job’s existing handling of gaps in older hours.
+
+• Added a readiness task group to [`gyml_online_train`](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py). Before submitting the EMR step, it waits up to one hour for S3 `_SUCCESS` markers:
+
+- At `run_dth` for the four Postgres snapshots and the `gyml-sent-event` schema partition.
+- At `run_dth − 1 day` for the `subscription-event` and `gyml-sent-event` history cutoff.
+
+Train-only and deploy-only runs skip these checks. Spark still handles gaps in earlier event hours, and the static regions dataset must already exist.
+
+All **24 GYML DAG tests passed**, including the date rollover check. Live S3 readiness remains to be verified.
+
+
+Q:
+
+› Good, but I think we allowed to make it a bit simpler: no need to check 'run_dth - 1 day', it will be enough to do all checks for 'run_dth' hour. Obviously, if events ready for 'run_dth', they are ready for 'run_dth - 1 day', don't you think?
+
+
+A:
+
+• I’ll use `run_dth` as the readiness cutoff for both event topics. That fits the upstream convention if hourly partitions complete in order. Spark will still read the event window ending one day earlier.
+
+• Simplified `gyml_online_train` to check all six `_SUCCESS` markers at `run_dth`. That’s a reasonable readiness cutoff if upstream hours complete in order. Spark still shifts the event window back one day and handles gaps in the history.
+
+All 24 GYML DAG tests passed.
+
+
+Q:
+
+› Good. OK, next few issues are about spark job 'GymlOnlinePrepareDatasetJob'. First problem i see as this: as a ETL job, it should follow a simple template: 'lift' data from storage and produce a set of DataFrame instances; 'transform' dataframes to resulting DataFrame; 'write' resulting dataframe to storage. Transform stage should be a pure function, for obvious reasons. But there is the rub: how we implement checkpoints (IO) inside pure function? My choice would be a collback pattern. We could pass to transform an instance of class that implements required set of checkpoint functions. Simplest checkpoint function (for tests, e.g.) would be the identity function. Any suggestions?
+
+
+A:
+
+• I’d use your callback pattern. Give `transform` one named checkpoint operation and let the job supply its implementation. One operation is enough because every checkpoint does the same thing: take a DataFrame and return the DataFrame the next step should use.
+
+```python
+inputs = self.lift(spark)
+result = transform(inputs, checkpoint=self.checkpoint)
+self.write(result)
+```
+
+I’d structure it this way:
+
+- **`lift`** reads the four snapshots, the region mapping, and both event streams into a `DatasetInputs` object. The schema lookup also belongs here. Read `account_games` once and reuse that DataFrame for requester features and receiver intersections.
+- **`transform`** builds the result from those inputs, calling `checkpoint("temp_pairs1", subscriptions)` and using the returned DataFrame downstream. Keep S3 paths, Parquet settings, and checkpoint partitioning in the checkpoint implementation.
+- **`write`** owns the final Parquet output and its overwrite policy.
+
+In production, the callback writes and reads the checkpoint back, preserving the current Spark materialization boundary. In transformation tests, `lambda name, frame: frame` keeps the function pure at the DataFrame level. A checkpoint test can exercise the Parquet behavior separately.
+
+If you want `transform` to be strictly pure even in production, put checkpoints between smaller pure transformation functions in `main`. For this job, I’d start with the callback. It keeps the data flow readable and preserves the existing checkpoint layout with a small change.
+
+
+Q:
+
+› Yes, my thoughts exactly, lets do it
+
+
+A:
+
+• I’ll split the job into lift, transform, and write steps and inject the checkpoint operation into transform. I’ll preserve the current checkpoint names, paths, and partitioning.
+
+• Refactored [`GymlOnlinePrepareDatasetJob`](/workspace/data/ml/data/pyspark_job/gyml_online.py:250) into `lift → transform → write`. `lift` loads the input DataFrames and reuses the `account_games` DataFrame. `transform` builds the result and delegates checkpoint I/O to the supplied callback. `write` persists the final Parquet dataset.
+
+All **9 Spark job tests passed**. The integration test confirmed that the identity callback produces the same rows without writing checkpoints, and that the production callback preserves the existing checkpoint layout and overwrite behavior.
+
+
+Q:
+
+› Perfect, thanks! Tomorrow we will continue with this issue: checkpoints produce 7500 small files with total size 2GB. Today we have to pause out session. Export today’s session, please
+
+
+A:
+
+• I’ll use the `export-session-dialog` skill to save today’s conversation, including the small checkpoint files issue for tomorrow.
