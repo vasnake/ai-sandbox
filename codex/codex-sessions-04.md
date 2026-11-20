@@ -1775,3 +1775,1277 @@ Q:
 A:
 
 • I’ll use the `export-session-dialog` skill to save today’s conversation, including the small checkpoint files issue for tomorrow.
+
+## 2026-11-20 gyml-online
+
+Q:
+
+› Hi, where were we?
+
+
+A:
+
+• We left off at the **Spark checkpoint small-files issue**. You observed about **7,500 checkpoint files totaling 2 GB** in `GymlOnlinePrepareDatasetJob`.
+
+We had just split the job into `lift → transform → write` and moved checkpoint I/O behind a callback. All nine Spark job tests passed, including the check that the refactor preserves the existing checkpoint layout.
+
+Next we planned to identify which checkpoint stages produce most of the files and see where we can reduce the count while preserving the output.
+
+
+Q:
+
+› Yes, sure. Well, I think, given the size of the data and its shape, we could just 'repartition(account_id, 4)' before each checkpoint. Can we?
+
+
+A:
+
+• I’ll check each checkpoint’s schema and write layout to see where four partitions would reduce the file count.
+
+• All seven checkpoints can use four account-hashed Spark partitions. The raw event checkpoint uses `accountId`, while the others use `account_id`. I’ll apply this in the checkpoint writer. `temp_pairs1` will still write by `dt/hour`, so it can produce up to four files per hour.
+
+• Yes. The [checkpoint writer](/workspace/data/ml/data/pyspark_job/gyml_online.py:289) now calls `repartition(4, account_column)` before each write. It uses `accountId` for raw events and `account_id` elsewhere.
+
+`temp_pairs1` keeps its date/hour layout, so it can still write up to four files **per hour**. The other checkpoints can write up to four files each under the current settings.
+
+All **9 Spark tests passed**, including output parity and checkpoint file counts. The actual S3 file count still needs a production-sized run.
+
+
+Q:
+
+› OK, looks good. But I don't get it, why do we need 'writer = writer.partitionBy("dt", "hour")' when 'if name == "temp_pairs1"'? What possible reasons could be there?
+
+
+A:
+
+• I’ll trace `temp_pairs1` back to the frozen pipeline and check how the automated job reads it today.
+
+• The current job doesn’t need it. We kept `partitionBy("dt", "hour")` to preserve the layout of the [original notebook pipeline](/workspace/data/research/gyml/online/scripts/prepare_dataset.py:235). I found no reader that uses `temp_pairs1` one hour at a time.
+
+Hourly folders would help if someone needed to inspect, read, or replace a specific hour. Here the job overwrites the whole checkpoint, reads it back from the root, and joins on `account_id` and `receiver_id`. The `dt` and `hour` values still matter for training, and a flat Parquet checkpoint can store them as regular columns. [Current job](/workspace/data/ml/data/pyspark_job/gyml_online.py:129)
+
+I’d remove the special case. Under the current write settings, that gives `temp_pairs1` up to four files **total** instead of four per populated hour. I’d verify that the final rows and the types of `dt` and `hour` match.
+
+
+Q:
+
+› OK, I agree. If we don't need it, get rid of it
+
+
+A:
+
+• I’ll remove the hourly write layout from `temp_pairs1` and verify that `dt` and `hour` still reach the final output with the expected types.
+
+• Removed hourly partitioning from `temp_pairs1`. It now writes up to four Parquet files total, with `dt` and `hour` stored as regular columns.
+
+All nine Spark tests passed. They verified the file limit, output rows, and `dt` and `hour` types.
+
+
+Q:
+
+› Marvelous! While we at it, tell me, am I wrong when I think that 'result.coalesce(1)' is a bad idea?
+
+
+A:
+
+• I’ll check whether anything downstream depends on the final dataset being a single Parquet file.
+
+• Your concern is valid. `result.coalesce(1)` makes one Spark task write the entire final dataset and can limit parallelism in the last stage. A single file is reasonable for a small export or when a consumer requires it, but training here reads the whole Parquet directory. [Training reader](/workspace/data/ml/gyml/online/train.py:29)
+
+I’d remove `coalesce(1)` and let Spark use the final join’s partitioning. If the next run produces too many small files, we can cap the output partitions based on the measured size. The checkpoints had a measured small-files problem. The final output hasn’t shown one yet.
+
+
+Q:
+
+› There 'join' right before write, isn't it?
+
+
+A:
+
+• Yes. `transform()` returns the left join of `pairs` and `intersections` on `(account_id, receiver_id)`. `write()` then calls `coalesce(1)` on that result before writing Parquet. [Final join](/workspace/data/ml/data/pyspark_job/gyml_online.py:155) · [Writer](/workspace/data/ml/data/pyspark_job/gyml_online.py:285)
+
+Removing `coalesce(1)` lets the write use the partitions produced by that join, so multiple tasks can write in parallel.
+
+
+Q:
+
+› So, coalesce here is a problem for join, isn't it?
+
+
+A:
+
+• I’ll check Spark’s documentation for how `coalesce(1)` affects the join upstream of the write.
+
+• Yes. In this job, `coalesce(1)` can bottleneck the **final left join itself**, as well as the write. Spark evaluates the join lazily. Because `coalesce(1)` doesn’t add a shuffle boundary, the single write task can end up doing the join work for all its input partitions. Earlier shuffle stages can still run in parallel. [Spark `coalesce` documentation](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.coalesce.html)
+
+I’d remove it and let Spark carry the join’s partitioning through to the write. Then we can measure the output file count on the next run.
+
+
+Q:
+
+› OK, I think, we should do this: replace coalesce with repartition; one result file is OK.
+
+
+A:
+
+• I’ll replace `coalesce(1)` with `repartition(1)` so the write still produces one file and the shuffle lets the final join run in parallel.
+
+• Replaced `coalesce(1)` with `repartition(1)` in the [final write](/workspace/data/ml/data/pyspark_job/gyml_online.py:285). Spark can run the join in parallel, then shuffle the result to one task that writes a single Parquet file.
+
+All nine Spark tests passed, including the single-file check.
+
+
+Q:
+
+› Good, thanks! I think we should add a rule about spark 'coalesce' in your permanent instructions (agents or skill files), the rule being: consider 'coalesce' in spark as a red flag, the situation needs attention and detailed analisys. As a basic principle of dealing with coalesce: probably it should be replaced with repartition or a chain like this (df.cache, log(df.count), dfcoalesce). What do you think?
+
+
+A:
+
+• I’ll add this to the repository’s review guidance. The rule will flag `coalesce` for analysis and explain when a shuffle or an explicit materialization step makes sense.
+
+• Added the rule to [AGENTS.md](/workspace/data/AGENTS.md:77). Spark `coalesce` deserves scrutiny, especially `coalesce(1)` before a write. Check the physical plan, upstream parallelism, data size, and required file count before changing it.
+
+`repartition(n)` is a good option when the upstream work should stay parallel and the extra shuffle is acceptable. The `persist → count → coalesce → write → unpersist` pattern also works when materializing the result is useful. It adds an action and uses cache space, so the rule treats it as an option to evaluate.
+
+
+Q:
+
+› Perfect! Approved and commited. Now we need to do a little refactoring of our AF DAG. I have a couple suggestions, but first I want to hear yours
+
+
+A:
+
+• I’ll read the current DAG and its shared helpers, then suggest a few focused refactors for us to discuss.
+
+• I’d start by making `create_dag()` read like the pipeline. It should declare the three stages, their selection checks, and their order. The details of submitting an EMR step or building a GitLab request can live in small helpers in the same module. [Current DAG](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py:145)
+
+1. **Extract `get_data_collect_tg()`.** Put the readiness checks, Spark arguments, EMR submission, and step watcher behind one stage builder, following the GNN DAG’s structure.
+2. **Extract `get_deploy_tg()`.** Keep the GitLab form and variable mapping together in an online-specific helper. Keep using the shared GitLab trigger and sensor.
+3. **Give online training a small wrapper.** The caller currently supplies the script, state directory, tmux session, and online model version independently. An online wrapper can keep those settings together and require the model version while reusing the shared EC2 lifecycle. [Shared training helper](/workspace/data/airflow/dags/batch/gyml/train_tasks/train.py:260)
+
+I’d do the first two together, then handle the shared training interface separately. Keep task IDs, dependencies, and skip behavior stable so the refactor is easy to verify.
+
+
+Q:
+
+› I agree, it aligns with my view. Training wrapper is a little more complex problem, I think. We should discuss it separately. And, by the way, I like how dag 'gyml_gnn_train' is organized, we should use it.
+
+
+A:
+
+• I’ll follow the GNN DAG’s structure and move collection and deploy setup into stage builders. I’ll keep the training call as it is for our separate discussion.
+
+• Refactored [`gyml_online_train`](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py:104) to follow the GNN DAG’s structure. `get_data_collect_tg()` owns readiness checks and EMR submission, and `get_deploy_tg()` owns the GitLab request. `create_dag()` now shows stage selection and execution order together.
+
+All 24 GYML DAG tests passed, covering task IDs, dependencies, skip behavior, and rendered arguments. The training wrapper is still open for our separate discussion.
+
+
+Q:
+
+› OK, good. Now I want to deal with this: in feed/als_train and in our gyml/gyml_online_train there are 'GITLAB*' constants. Probably it will be a good idea to move them to 'airflow/dags/extentions/gitlab/__init__.py'. We have to obey DRY, don't we? What do you think?
+
+
+A:
+
+• I’ll compare both DAGs’ constants and move the shared GitLab settings into `extentions.gitlab`. Each DAG can keep the values that select its own deployment.
+
+• Agreed. Both DAGs now import the Data project ID and the two Airflow token references from [the shared GitLab module](/workspace/data/airflow/dags/extentions/gitlab/__init__.py). Each DAG keeps its own subproject, release tag, and deployment settings.
+
+All 24 GYML DAG tests passed. I also verified locally that the ALS trigger still renders the expected project, token, and subproject.
+
+
+Q:
+
+› Cool! A minor fix though: I think we should rename 'GITLAB_PROJECT_ID' to 'GITLAB_DATA_PROJECT_ID', as it points to 'data' gitlab project
+
+
+A:
+
+• I’ll rename the constant and update both DAGs to use `GITLAB_DATA_PROJECT_ID`.
+
+• Renamed the shared constant to `GITLAB_DATA_PROJECT_ID` and updated both DAGs. It still points to project `14`. Syntax checks and all nine GYML Online DAG tests passed.
+
+
+Q:
+
+› Great! And it got me thinking: probably we should replace 'GITLAB_SUBPROJECT' with 'GITLAB_ALS_SERVICE_SUBPROJECT' and 'GITLAB_GYML_ONLINE_SERVICE_SUBPROJECT'? And put them into 'airflow/dags/extentions/gitlab/__init__.py'?
+
+
+A:
+
+• I’ll move both subproject constants into `extentions.gitlab` under the names you proposed. The GitLab `SUBPROJECT` values will stay the same.
+
+• Moved `GITLAB_ALS_SERVICE_SUBPROJECT` and `GITLAB_GYML_ONLINE_SERVICE_SUBPROJECT` into [the shared GitLab module](/workspace/data/airflow/dags/extentions/gitlab/__init__.py) and updated both DAGs. The routing values are still `post-recommender-als-service` and `gyml_online`. Syntax checks and all nine GYML Online DAG tests passed.
+
+
+Q:
+
+› Perfect! Now we are ready to refactor our training wrappers and helpers. Lets move step-by-step, from easy parts to mo difficult. First, I think that constants 'ec2_instance_id' and 'ssh_conn_id' should be put in 'airflow/dags/batch/gyml/__init__.py' in the instance of a dataclass, probably. And both gyml dags should use that shared instance. No problem here?
+
+
+A:
+
+• I’ll put the EC2 instance ID and SSH connection ID in one frozen dataclass instance and have both GYML DAGs use it. That gives the shared host one definition while keeping each DAG’s training settings local.
+
+• Both GYML DAGs now use the frozen [`GYML_TRAINING_HOST`](/workspace/data/airflow/dags/batch/gyml/__init__.py:38) instance for their EC2 instance ID and SSH connection ID. Each DAG still defines its own training settings, and the GNN builder still accepts an explicit host and connection.
+
+All 24 GYML DAG tests passed.
+
+
+Q:
+
+› Perfect! Now complex stuff, we should plan and execute carefully. I think we should rework 'class TrainTasks' into one base abstract class that implements all procedures; and derive two concrete subclasses for gyml-gnn and gyml-online, where we can put all individual details. What is your view?
+
+
+A:
+
+• I’ll trace `TrainTasks` and both callers so the proposed split follows the lifecycle they already share.
+
+• I agree. `TrainTasks` already owns a shared lifecycle. The awkward part is that it defaults to GNN, then the online DAG has to override several settings and supply an extra argument to make it work. Two concrete classes would make those combinations explicit. [Current `TrainTasks`](/workspace/data/airflow/dags/batch/gyml/train_tasks/train.py:76)
+
+| Class | Responsibility |
+| --- | --- |
+| Abstract `TrainTasks` | Start and stop EC2, check SSH readiness, upload scripts, launch tmux, read logs and exit status, and propagate failures. |
+| `GnnTrainTasks` | Select the GNN wrapper, state directory, and tmux session. Build the GNN command arguments. |
+| `OnlineTrainTasks` | Select the online equivalents, require `index_id_online`, and append it to the wrapper arguments. |
+
+I’d give the base class **one abstract method** for building the wrapper arguments. Script name, state directory, and tmux session can be class attributes. Both subclasses can expose the same `submit_training(index_id, run_dth)` method through the base class, with the online version required when constructing `OnlineTrainTasks`. That removes the optional online argument from the shared task group and keeps `run_dth` in Airflow’s templated task arguments.
+
+I’d do it in two steps:
+
+1. Introduce the classes and keep one task-group builder that accepts a `TrainTasks` instance. Wire both DAGs and verify that task IDs, timeouts, upload paths, commands, and cleanup behavior match the current implementation.
+2. Review the shell wrappers separately once the Python interface is settled. That keeps the first change reviewable and gives us a stable baseline for any shell changes.
+
+
+Q:
+
+› OK, looks good. But I don't understand how you propose to use 'submit_training(index_id, run_dth)' in gyml-online? As I see it, it should be method with variable parameters, or it should be just 'submit_training()' and parameters construction are hidden in concrete derived classes?
+
+
+A:
+
+• My earlier proposal was to give `OnlineTrainTasks` its `index_id_online` when constructing it. The inherited `submit_training(index_id, run_dth)` would then call an online-specific method that adds the stored version to the wrapper arguments.
+
+I’d simplify that further: **store both model IDs in the concrete instance and expose `submit_training(run_dth)`**. The IDs are fixed when the DAG is built. `run_dth` comes from the DAG run, so Airflow can render it through `op_kwargs` before calling the method. Each subclass builds its own argument list, and the shared task group has the same interface for both.
+
+A zero-argument `submit_training()` can also work if it reads `run_dth` from Airflow’s task context. I’d keep that one argument explicit so the method is easy to call and test without an Airflow context.
+
+
+Q:
+
+› OK, I like it. Lets go
+
+
+A:
+
+• I’ll make `TrainTasks` abstract, move model identity and wrapper arguments into the GNN and online subclasses, and keep `run_dth` as the explicit Airflow task argument. I’ll check both DAGs against their current launch commands and task graph.
+
+• Refactored [`TrainTasks`](/workspace/data/airflow/dags/batch/gyml/train_tasks/train.py:80) into an abstract base with `GnnTrainTasks` and `OnlineTrainTasks`. The base owns the shared EC2 and SSH lifecycle. Each subclass owns its wrapper, state directory, tmux session, and model arguments. Airflow passes only the rendered `run_dth` to `submit_training()`.
+
+All **24 DAG tests and 5 shell wrapper tests passed**, covering the launch commands, upload paths, timeouts, and cleanup behavior. Live EC2 execution remains unverified.
+
+
+Q:
+
+› I think it's perfect, thanks! One question though: why dataclass and not ordinary class?
+
+
+A:
+
+• I used a dataclass to avoid repeating constructor code. `TrainTasks` declares the common settings once, and `OnlineTrainTasks` adds one required field, `index_id_online`. Python generates the constructors for both. `kw_only=True` makes calls readable because several parameters are strings, and `frozen=True` prevents accidental reassignment after the DAG is built.
+
+An ordinary class would work just as well with explicit constructors. The abstract base class provides the shared lifecycle and requires each subclass to supply its wrapper arguments. The dataclass just handles how the settings are initialized and stored.
+
+
+Q:
+
+› OK, what about shell wrappers?
+
+
+A:
+
+• I’ll review the shell wrappers now that Python owns the job-specific launch settings, and look for anything the shell layer can simplify.
+
+• I’d keep `run_gnn_train.sh` and `run_online_train.sh` as separate entry points and simplify `run_train.sh`. The wrappers currently pass a job kind, then the shared runner switches on that kind to recover settings the wrapper already knows. [Shared runner](/workspace/data/airflow/dags/batch/gyml/train_tasks/scripts/run_train.sh)
+
+- **Each wrapper** selects its work directory, container name, and ML job selector. The online wrapper also supplies the online model version override.
+- **`run_train.sh`** handles the common work: validate and split `run_dth`, download the ZIP, authenticate to ECR, launch Docker, and record logs and exit status.
+
+The main thing to preserve is failure reporting. Today the runner installs the exit trap before validating the training arguments. If validation moves into a wrapper, that wrapper could exit before writing `exit_code`, and Airflow would report a lost session instead of a training failure.
+
+I’d keep the existing wrapper argument order and `exec` behavior. The five wrapper tests give us a baseline for checking the Docker arguments and failure path after the split.
+
+
+Q:
+
+› A litle more details, please. I'm not sure I understand what changes you're proposing
+
+
+A:
+
+• I’m proposing to move the `case "$job"` logic out of `run_train.sh`. Today the online wrapper says “run the online job,” and the shared runner then looks up what “online” means. After the change, the wrapper would supply those settings directly.
+
+For example, `run_online_train.sh` would keep the same five positional arguments Airflow sends today. Internally it would look roughly like this:
+
+```bash
+source "$(dirname "${BASH_SOURCE[0]}")/run_train.sh"
+
+init_training "${TRAIN_STATE_DIR:-/tmp/ml/gyml_online/airflow}"
+online_version="${5:?Online index version is required}"
+
+run_training \
+    /tmp/ml/gyml_online gyml_online_train \
+    "$1" "$2" "$3" "$4" \
+    "+cmdline.ml_job=gyml_online_train" \
+    "gyml_online.index_id_online='$online_version'"
+```
+
+`init_training` opens the training log and installs the exit trap **before** the wrapper validates `online_version`. That way, a missing version still leaves an exit code for Airflow. `run_training` takes the work directory, container name, image, ZIP URI, index, and `run_dth`, followed by the ML overrides. It handles the date/hour split, ZIP download, ECR login, and Docker launch for both jobs.
+
+The GNN wrapper would do the same with its own paths and `train,inference` selector, with no online version argument. Sourcing the shared file keeps both functions in the wrapper’s shell, so the exit trap covers the whole run. **Airflow would still upload the same two files and invoke the same wrapper command.**
+
+
+Q:
+
+› OK, got it. I agree, it will be better. Lets do it
+
+
+A:
+
+• I’ll move the job-specific settings into the two wrappers and keep the shared runner focused on setup and launch. I’ll verify both Docker commands and the exit marker when the online version is missing.
+
+• Refactored the GNN and online shell wrappers so each defines its own paths, container name, and ML arguments. Both source the [shared runner](/workspace/data/airflow/dags/batch/gyml/train_tasks/scripts/run_train.sh) for logging, ZIP download, ECR login, Docker execution, and exit status.
+
+Airflow still invokes the wrappers with the same arguments. All **5 wrapper tests and 24 GYML DAG tests passed**, including exit marker creation when the online version is missing.
+
+
+Q:
+
+› OK, looks good. But why '"${1-}" "${2-}" "${3-}" "${4-}"' in one script and '"$1" "$2" "$3" "$4"' in another? Why the difference in handling parameters?
+
+
+A:
+
+• Both wrappers use `set -u`. In the GNN wrapper, `${1-}` expands to an empty string if the argument is missing, so `run_training` can report a specific error such as `Docker image argument is required`. Bare `$1` would make Bash exit with an `unbound variable` error before the shared function runs.
+
+The online wrapper first validates `${5:?Online index version is required}`. If that succeeds, the first four positional arguments are guaranteed to exist. They can still be empty, and `run_training` checks for that in both wrappers. So the difference is deliberate, though using `${1-}` through `${4-}` in both would also work.
+
+
+Q:
+
+› Interesting twist, OK.
+
+
+A:
+
+• Got it.
+
+
+Q:
+
+› Approved, commited. One last task before we could get back to our deferred review. For some obscure reason we don't have 'gyml_online/CHANGELOG.md'. Lets add this file and make an entry for our new version. Look at others 'data' project changelogs to get an idea on how it should look like
+
+
+A:
+
+• I’ll check the other project changelogs for their format and compare the service changes against the last release before writing the new entry.
+
+• Added [gyml_online/CHANGELOG.md](/workspace/data/gyml_online/CHANGELOG.md) with a Russian entry for `0.2.0` in the repository’s changelog style. It covers packaged inference, automated GitLab and ECS deployment, image tagging, and local testing.
+
+
+Q:
+
+› Good, commited.
+
+
+A:
+
+• Great. We’re ready to return to the deferred review findings.
+
+
+Q:
+
+› OK, but first we should re-check our code, we change it since the time of review
+
+
+A:
+
+• I’ll compare the current branch with the revision from the preliminary review, then check which findings still apply and whether the newer changes introduced any regressions.
+
+• Rechecked `5b95a275` against the preliminary review revision `658e0b2b`. I found no new happy-path blocker. The training-wrapper refactor addresses the earlier DRY/SOLID follow-up, and the Spark job now writes flat checkpoints with up to four Parquet files each. The single-file final output uses `repartition(1)` after the join.
+
+The **12 numbered findings** in the [review file](/workspace/data/MLDE-654-review.md) still apply. The incomplete training cache remains the highest priority.
+
+Two new follow-ups from the changes:
+
+- **[P3] The ML runbook gives the wrong launch instructions.** It labels the DAG `gyml_gnn_train` and uses singular `stage=...`. The DAG is `gyml_online_train` and expects a `stages` array. [ML runbook](/workspace/data/ml/README.md:239)
+- **[P3] ECS can report a rollback as a timeout.** The revision check correctly rejects the old revision, but it runs after `services-stable`. If ECS has already removed the failed revision by then, the script waits five more minutes instead of identifying the rollback. [Rollout check](/workspace/data/gyml_online/.ci/update_ecs_service.sh:63)
+
+**102 local tests passed** across Airflow, Spark, ML, and the wrappers. Py4J logged a shutdown error after the tests passed. I didn’t rerun the live pipeline or measure the checkpoint file count on S3.
+
+
+Q:
+
+› OK, good. I fixed ML runbook typos. OK, update our review doc with new info and lets fix problems, one-by-one. Before fixing, you should discuss with me the problem and ways to fix it.
+
+
+A:
+
+• I’ll update the review document with the re-check results and your runbook fix. Then I’ll walk through finding 1 and the options before changing any code.
+
+• Updated the [review document](/workspace/data/MLDE-654-review.md:7) with your runbook fix, the re-check results, the resolved training-wrapper follow-up, and the ECS rollback diagnostics finding.
+
+For [finding 1](/workspace/data/MLDE-654-review.md:33), the problem is that `PreTrain` treats a nonempty directory containing any Parquet file as a valid cache. If the second of ten downloads fails, the retry can silently train on the first file. A complete cache can also be stale when Spark overwrites the same S3 partition. The downloader reads only the first S3 listing page, which is another way to get an incomplete input.
+
+I’d use a **fresh download for the prepared dataset and a verified cache for the upstream embeddings**:
+
+- **Prepared dataset:** Download it on every training run because Spark can overwrite that partition.
+- **Upstream embeddings:** Reuse a local copy only if a completion marker identifies the same S3 source. This assumes the upstream model’s embeddings are immutable once published.
+- **Both:** Paginate the S3 listing, download to a sibling staging directory, and move the download into place only after all files arrive and at least one is Parquet. A failed download leaves no partial directory for the next run to mistake for complete.
+
+Refreshing both inputs would be simpler but would redownload the embeddings on every retry. If embeddings can change under the same S3 prefix, I’d refresh both until we have a reliable source version to validate against. Does the immutability assumption hold for upstream embeddings?
+
+
+Q:
+
+› Hm, I understand the problem. Maybe it will be more optimal, if we put some success marker in the local dir after sucessful download. If we can't find that marker, we should just remove local directory and download from remote. How about that?
+
+
+A:
+
+• Yes. A local completion marker is simpler than staging for our sequential training runs. I’d call it `.download-complete` so it can’t be confused with a Spark `_SUCCESS` file copied from S3. Write it only after every page has been listed, every file has downloaded, and at least one Parquet file is present. If the marker is missing or names a different S3 source, delete the local directory and download again.
+
+That solves **incomplete downloads**. The remaining question is **freshness**. Spark can overwrite a prepared dataset at the same S3 path, so a valid local marker could still point to yesterday’s copy of that partition.
+
+My recommendation is to **reuse marked embeddings and refresh the prepared dataset on every training run**. That keeps the cache where it helps most and makes a training rerun pick up any rebuilt features. Does that split work for you?
+
+
+Q:
+
+› Freshness is out of the picture. During experiments it is the human manual job; and during production daatsets are immutable.
+
+
+A:
+
+• I’ll apply the completion marker to both inputs. A marked cache can be reused, and an unmarked or invalid cache will be downloaded again. I’ll leave freshness to the operating rules you described.
+
+• Implemented the completion marker for both the prepared dataset and upstream embeddings. `.download-complete` records the source URI and is written only after all S3 listing pages have been processed, all downloads succeed, and at least one Parquet file is present. A retry clears an unmarked or mismatched cache before downloading again.
+
+Freshness remains manual for experiments, with immutable inputs in production. I recorded the fix under [finding 1](/workspace/data/MLDE-654-review.md:33). All **31 focused tests passed**, including a download interrupted on the second S3 page.
+
+
+Q:
+
+› why you changed 'download_folder_from_s3' function?
+
+
+A:
+
+• Because the completion marker is only trustworthy if we download the whole S3 prefix. `download_folder_from_s3()` previously made one listing request, so a prefix that spanned multiple pages could appear complete after only the first page was downloaded.
+
+I changed the shared helper to iterate through every page. Its signature and overwrite policy are unchanged, and the completion marker still belongs to GYML Online’s `PreTrain`. Other callers now get the full listing too.
+
+
+Q:
+
+› So, basically, this procedure were defective? oops
+
+
+A:
+
+• Yes. It had a silent truncation bug. It worked when the prefix fit on one listing page, but for larger prefixes it downloaded only the first page and returned successfully. Pagination fixes that. The local completion marker addresses a separate failure mode: a retry mistaking an interrupted download for a complete cache.
+
+
+Q:
+
+› OK, great, thanks. Commited. Next?
+
+
+A:
+
+• Next is [finding 2: a partial model upload blocks retries](/workspace/data/MLDE-654-review.md). If `model_state.pth` uploads successfully and `metadata.yaml` fails, deploy can’t use the model. A training retry also stops at the nonempty-prefix check, even though the completed artifacts are still on EC2.
+
+I see two practical fixes:
+
+1. **Document manual recovery.** If S3 contains only the weights and they match the retained local file, upload the metadata from that same run and retry deploy. This avoids retraining and keeps the existing guard.
+2. **Add an explicit publish-only command.** Automate the same verification and upload. This makes sense if operators encounter the failure often enough to justify another entry point.
+
+I’d start with manual recovery. It handles the failure without adding automatic deletion or overwrite to the training job. Does that fit how you want to operate partial releases?
+
+
+Q:
+
+› I think in our case the right thing to do is just document this unfortunate scenario as a possibility. To implement upload transactionally, the simplest way would be to pack both files into zip and upload one file. Or add metadata to a torch state dictionary with intention to have only one file. Just now it looks like overkill.
+
+
+A:
+
+• I’ll document what an interrupted upload leaves behind, how it affects retries, and record the decision in the review. The two-file artifact format can stay as it is.
+
+• Documented the partial-upload scenario in the [training README](/workspace/data/ml/gyml/online/README.md:55) and recorded the decision under [finding 2](/workspace/data/MLDE-654-review.md:50). If the weights upload succeeds and the metadata upload fails, deploy and same-ID training retries require manual recovery. We’re keeping the two-file format for now.
+
+
+Q:
+
+› Good, commited. Next?
+
+
+A:
+
+• Next is [finding 3](/workspace/data/MLDE-654-review.md), the game vocabulary mismatch when `flag_games_intersected=false`. In that mode, training encodes games using the `games` dictionary, but sizes the embedding table using `games_added`. If `games` assigns an ID beyond that table’s size, training crashes. The default intersected mode uses the correct dictionary.
+
+I’d give vocabulary selection one source of truth: use `games_intersected` in intersected mode and `games` otherwise. Then use that same dictionary for encoding, sizing the embedding table, and exporting the model. A regression test should give the two dictionaries different sizes so the old bug can’t pass by coincidence.
+
+I’d keep the separate cleanup of unused `games_added` processing for later. Does that scope work for you?
+
+
+Q:
+
+› I don't see it, 'def build_vocabularies' looks fine. Give me more details, please
+
+
+A:
+
+• I’ll trace one game ID from `build_vocabularies` through batch encoding and the model’s embedding lookup.
+
+• The dictionaries themselves are built correctly. The mismatch is in **which dictionary size `build_vocabularies()` returns** when `flag_games_intersected=false`.
+
+| Step | What it uses in that mode |
+|---|---|
+| Size the model’s game embedding | `added_size`, from `games_added`. [Size selection](/workspace/data/ml/gyml/online/train.py:63) |
+| Encode the game fed to the model | The `games` dictionary, built from request games. [Batch encoding](/workspace/data/ml/gyml/online/dataset.py:60) |
+| Export the dictionary for inference | The same `games` dictionary. [Model export](/workspace/data/ml/gyml/online/train.py:199) |
+
+For example, suppose `games = {11: 2, 22: 3}` and `games_added = {11: 2}`. With two reserved slots, `added_size` is **3**, so the embedding accepts indices `0`, `1`, and `2`. When the batch encodes game `22`, it produces index **3**, which is out of range.
+
+The minimal fix is to capture `games_size` from the first `build_dictionary()` call and return it in the non-intersected branch. The default intersected branch already uses `games_intersected` for both sizing and encoding.
+
+
+Q:
+
+› OK, I see the problem. Well, intention behing this is not clear for me, and I can't ask the author of this code. So, at least we should understand, how different 'games' and 'games_added' could be. I have an incling that they are the same
+
+
+A:
+
+• I’ll trace where both fields come from and look for recorded vocabulary counts from the reference run. That should show whether they can differ and whether they did in practice.
+
+• They can contain the same game IDs for a given user, but the recorded training run shows they produce **different vocabularies**.
+
+- **`games`** comes from `gyml-sent-event.filters.gameIdsFromRequest`, grouped by requester and receiver. Repeated request games can count more than once. [Event transformation](/workspace/data/ml/data/pyspark_job/gyml_online.py:237)
+- **`added_games`**, used to build `games_added.json`, comes from the requester’s `account_games` snapshot, capped at 32 entries. [Snapshot transformation](/workspace/data/ml/data/pyspark_job/gyml_online.py:189)
+
+Your intuition fits one of the recorded examples: both contain `322`, `120`, and `10`. In the next example, `games` repeats all three IDs while `added_games` lists them once. That alone can change which games pass the frequency threshold. [Sample rows](/workspace/data/research/gyml/online/scripts/README.md:145)
+
+Across the reference run, **`games` retained 2,430 distinct IDs and `games_added` retained 1,024**, before adding the two reserved slots. That confirms the size mismatch on real data, even though we don’t know how much the two sets overlap. [Recorded vocabulary counts](/workspace/data/research/gyml/online/scripts/train.py:483)
+
+
+Q:
+
+› Well, as you showed me the trace for 'flag_games_intersected=false', show me the same trace for 'flag_games_intersected=true'. Better still, show that table for both, to compare
+
+
+A:
+
+• | Step | `flag_games_intersected=true` (default) | `flag_games_intersected=false` |
+|---|---|---|
+| Sample games for each example | `matching_intersected_games` — request games also found in the **receiver’s** profile | `games[0]` — games from the matching requests |
+| Encode the sampled game | `games_intersected` dictionary | `games` dictionary |
+| Size the model’s game embedding | `intersected_size`, from `games_intersected` | `added_size`, from `games_added` — the **requester’s** profile games |
+| Export the dictionary for inference | `games_intersected` | `games` |
+
+With **`true`**, the same vocabulary drives encoding, embedding size, and inference. The reference run needed **159 slots**, including the two reserved slots.
+
+With **`false`**, encoding and inference agree, but the embedding is sized from a different dictionary. The reference run needed **2,432 slots** for request games, while `added_size` supplied only **1,026**.
+
+[Batch encoding](/workspace/data/ml/gyml/online/dataset.py:60) · [Size selection](/workspace/data/ml/gyml/online/train.py:54) · [Export](/workspace/data/ml/gyml/online/train.py:199) · [Reference counts](/workspace/data/research/gyml/online/scripts/train.py:483)
+
+
+Q:
+
+› OK, got it. Well, lets change games_added to games for intersected=false. But leave the old code commented, not deleted. And add comments explaining 'why'. OK?
+
+
+A:
+
+• I’ll size the non-intersected model from `games`, keep the old selection commented with the reason it was wrong, and leave the `games_added` dictionary generation in place because the batch generator still reads it.
+
+• With `flag_games_intersected=false`, the model now sizes its game embedding from `games`, the same dictionary used for encoding and inference. I kept the old selection as a comment and explained why it could produce out-of-range IDs. The default intersected mode still uses `games_intersected`.
+
+All 35 training and inference tests passed, including both modes with different dictionary sizes.
+
+
+Q:
+
+› batch generator reads games_added dictionary? For what purpose?
+
+
+A:
+
+• It reads `games_added.json` to encode the requester’s profile games into a `games_added` list on each generated example. [Dataset generator](/workspace/data/ml/gyml/online/dataset.py:60)
+
+The model never receives that list. `generate_batches()` only copies the fields in `INPUT_KEYS` and the target vector, and `games_added` isn’t in `INPUT_KEYS`. So today it’s leftover work from the reference pipeline: we build the dictionary, read it, and encode the list, then discard it. [Batch assembly](/workspace/data/ml/gyml/online/dataset.py:115) · [Model input keys](/workspace/data/ml/gyml/online/transforms.py:85)
+
+
+Q:
+
+› I'm confused. Maybe we should use 'games_added' instead of 'games' on 'intersected-false'?
+
+
+A:
+
+• We could, but that would change what the model learns. One plausible reading of `intersected=false` is “use the request games without intersecting them with the receiver’s profile.” That’s what the current sampler does. `games_added` would instead sample from the requester’s profile snapshot, which can differ from the games they actually requested.
+
+The old embedding size is a clue that profile games may have been considered. The sampler and the exported inference dictionary both use request games, though, and the serving contract describes `games` as IDs from the matching filter. Those are stronger reasons to keep `games` for this fix. [Training sampler](/workspace/data/ml/gyml/online/dataset.py:60) · [Serving contract](/workspace/data/ml/gyml/online/inference.py)
+
+If we want to try profile games, I’d treat that as a separate model experiment and first confirm serving can supply the same feature.
+
+
+Q:
+
+› well, I know for a fact that we pass to inference data from user's profile, game list there is a list of games from profile (games_added in terms of train?)
+
+
+A:
+
+• Yes. If serving receives the **requester’s profile games**, the corresponding training feature is `added_games`, encoded through the `games_added` dictionary. Training uses a snapshot capped at 32 entries, so the two lists can differ even though they represent the same feature. My earlier statement about serving receiving matching-filter games came from the docstring. Your confirmation is better evidence of what the caller actually sends.
+
+That gives us two distinct choices:
+
+- **Preserve the existing `false` behavior.** Sample request games and use `games` for sizing, encoding, and export. This fixes the index error while preserving the training behavior.
+- **Align `false` with serving.** Sample `added_games` and use `games_added` for sizing, encoding, and export. That makes training and serving use the same kind of input in this mode.
+
+Given what you confirmed, I’d favor the second option if `false` is meant to represent the serving input. It changes which examples the model trains on, so it needs retraining and evaluation. The default `true` mode still samples request games that intersect the receiver’s profile, which is a separate design choice.
+
+
+Q:
+
+› what docstring are you talking about? show me
+
+
+A:
+
+• I’ll pull up the exact line I was referring to.
+
+• It’s the `Model.inference()` docstring in [inference.py:79](/workspace/data/ml/gyml/online/inference.py:79):
+
+> `games`: list of game IDs from the matching filter, e.g. `[11, 22]`.
+
+That wording is what I relied on. Based on your confirmation about the caller, it should say **“game IDs from the requesting user’s profile.”**
+
+
+Q:
+
+› yes, but who wrote this docstring? Who provided this information?
+
+
+A:
+
+• I’ll check the blame for that line and the conversation around it to distinguish who wrote it from where the claim came from.
+
+• I wrote it. You asked me to document the expected features, and I added that wording. Git blame points to `a0a302a8`, the commit where you checked in the docs.
+
+You didn’t tell me serving used matching-filter games. That was my assumption based on the training code, and I hadn’t verified it against the caller. I then cited my own docstring as evidence. Your confirmation that serving passes profile games is the source we should use.
+
+
+Q:
+
+› OK, I'm glad we could get to the bottom of this. Now we need to fix docstring. And train code, that should use 'added_games' if intersection=false. OK? My note about leaving original code commented is still valid.
+
+
+A:
+
+• I’ll correct the inference docstring and make `flag_games_intersected=false` use profile games for sampling, embedding size, and export. I’ll keep the old request-game branches as comments and test both modes with deliberately different vocabularies.
+
+• Corrected the inference docstring to say `games` comes from the requesting user’s profile. With `flag_games_intersected=false`, training now samples `added_games` and uses the `games_added` dictionary for encoding, embedding size, and inference export. I kept the old request-game path in comments and explained why it changed.
+
+All 48 focused tests passed. The training test verified both modes with different game IDs and vocabulary sizes.
+
+
+Q:
+
+› OK, commited. Next?
+
+
+A:
+
+• Next is [finding 4](/workspace/data/MLDE-654-review.md): an all-null game column can crash vocabulary building. `build_dictionary()` skips nulls, then passes the remaining arrays to `np.concatenate()`. If every `matching_intersected_games` value is null, NumPy receives an empty list and raises an error. This can even affect `flag_games_intersected=false`, because training still builds both dictionaries.
+
+I’d count directly with `Counter.update()` for each non-null list. That preserves the counting and ID assignment rules for populated inputs. For an all-null column, it produces an empty dictionary with the two reserved embedding slots. The sampler already maps a null game list to the unknown-game ID, so those rows can still contribute to training.
+
+I’d keep this fix scoped to dictionary construction and add a regression test for the all-null case.
+
+
+Q:
+
+› OK, lets try this. But add a warning log when dictionary is empty, OK?
+
+
+A:
+
+• I’ll replace the concatenate step with incremental counting and log a warning whenever no games pass into the vocabulary. The empty dictionary will keep the two reserved embedding slots.
+
+• `build_dictionary()` now counts games incrementally. If no games are retained, it logs a warning with the field and threshold, saves `{}`, and keeps the two reserved embedding slots.
+
+All 50 focused tests passed, including all-null input and games filtered out by the threshold.
+
+
+Q:
+
+› OK, commited. Next?
+
+
+A:
+
+• Next is [finding 5](/workspace/data/MLDE-654-review.md), the synthetic integration test’s cleanup and exit status. It has three problems:
+
+- On a clean checkout, `rm -v` can abort the script because there’s no old ZIP.
+- After a successful smoke test, the image script removes the container. The wrapper then calls `docker logs` on that removed container and reports failure.
+- If a test fails, `set -e` stops the wrapper before it cleans up the synthetic model in S3.
+
+I’d fix this in two places. The **image smoke script** should capture logs on failure before removing the container it started. The **synthetic wrapper** should tolerate a missing old ZIP and use an exit trap to clean up the two model artifacts it uploaded, while preserving the original test failure.
+
+For safe cleanup, I’d give each run its own synthetic model prefix. The shared `-dev` ML ZIP can continue to be uploaded as agreed. Does that match how you want the test to behave?
+
+
+Q:
+
+› Valid points, agree. Plus, we should remove container in exit trap also, no?
+
+
+A:
+
+• Yes. I’ll put container cleanup in the image script’s exit trap so it can capture failure logs before removal. The synthetic wrapper will use its own trap for the test run’s S3 model files.
+
+• Yes. The image smoke test now removes its container by ID in an exit trap. On failure, it captures the container logs before removal and preserves the original exit status.
+
+The synthetic test now builds its ZIP in a fresh workspace and uses a unique S3 prefix for the model. Its own exit trap removes those two model objects, including after a partial upload. The shared `-dev` ZIP is still published as agreed.
+
+All 10 artifact tests passed. Mocked runs also verified cleanup after success, Docker startup failure, a failed health check, and a partial S3 upload. A live Docker/S3 run remains unverified.
+
+
+Q:
+
+› Fixed minor issues, commited. I have to remind you: readability is very important, the more laconic is code, the more important intent delivery throu naming and comments
+
+
+A:
+
+• Understood. I’ll use names that make the code’s purpose clear and add short comments where a constraint or decision would otherwise be easy to miss. I’ll apply that to the remaining fixes.
+
+
+Q:
+
+› OK, next?
+
+
+A:
+
+• Next is [finding 6](/workspace/data/MLDE-654-review.md): the service can fail to start under `uv` as a regular user. Python’s `dictConfig()` opens `/var/log/gyml-online.log` at startup, even though neither the app nor Uvicorn uses that file handler. I reproduced the resulting `PermissionError` during the review.
+
+I’d remove the unused file handler and its JSON formatter. Both loggers already write to the console, so this preserves where their logs go and removes the need for write access to `/var/log`. If we expect to use file logging later, `delay: true` would also fix startup, but it would leave unused configuration in place.
+
+I’d verify the fix by starting the service as a regular user and checking that `/health` returns `ready`.
+
+
+Q:
+
+› in which file?
+
+
+A:
+
+• [`gyml_online/app/config/logging.yaml:17`](/workspace/data/gyml_online/app/config/logging.yaml:17). The `handlers.file` block points to `/var/log/gyml-online.log`. The `app` and `uvicorn` loggers use `console_out` and `console_err`.
+
+
+Q:
+
+› OK, fixed. Next?
+
+
+A:
+
+• Next is [finding 7](/workspace/data/MLDE-654-review.md): **Airflow can time out while GitLab is still deploying.** The shared sensor waits one hour. That budget includes the time GitLab spends queued behind another deploy, plus the build, tests, and ECS rollout. If the sensor times out, the GitLab pipeline can still finish and change the service after Airflow reports failure.
+
+I’d make the wait configurable in the shared helper, keep the one-hour default for ALS, and give GYML Online two hours within its six-hour DAG budget. I’d also document that operators should check the original GitLab pipeline before retrying a timed-out deploy.
+
+That reduces avoidable timeouts. The risk of GitLab continuing after Airflow stops waiting remains, and automatic cancellation would need its own policy for a rollout already underway.
+
+
+Q:
+
+› I think 1 hour is more than enough. Sensor failure triggers manual investigation procedure, so instructions to check gitlab pipeline should be in the guidebook. That guidebook is maintained elsewhere, so - not our problem.
+
+
+A:
+
+• I’ll record the one-hour timeout and the external guidebook as the resolution for finding 7. I’ll also verify the logging fix before marking finding 6 resolved.
+
+• Recorded both decisions in the [review document](/workspace/data/MLDE-654-review.md:108). The logging fix is resolved, and I verified the console-only configuration loads under `uv`. The GitLab sensor keeps its one-hour timeout, with manual investigation covered by the external operations guidebook.
+
+
+Q:
+
+› OK, next?
+
+
+A:
+
+• Next is [finding 8](/workspace/data/MLDE-654-review.md), the stale service deployment docs. We already corrected the synthetic test instructions. The remaining issue is that the README still says a push to `main` deploys to prod and other pushes offer a manual develop deploy.
+
+The current CI starts the service pipeline only through a matching GitLab API trigger with `SUBPROJECT=gyml_online`. The Airflow deploy stage sends that trigger, and deployment runs automatically for either selected environment.
+
+I’d replace the stale paragraph with that trigger rule and leave the accurate ECS mapping, image tagging, and rerun instructions in place.
+
+
+Q:
+
+› Yes, I kept this in mind, thanks. Definetely we should update docs for 'gyml_online/' subproject
+
+
+A:
+
+• I’ll update the service README to match the current GitLab trigger, model interface, and release settings, while preserving the operational details that still apply.
+
+• Updated the [service README](/workspace/data/gyml_online/README.md) to match the current GitLab API trigger, deployment inputs, ECS targets, and image tags. I also replaced the old model interface example and updated the local build instructions to use the CI script with `no-push`.
+
+Marked finding 8 resolved. The updated links and Bash examples passed local checks.
+
+
+Q:
+
+› OK, fixed and commited. Next?
+
+
+A:
+
+• Next is [finding 9](/workspace/data/MLDE-654-review.md): **recall can score a bad checkpoint as good.** We reproduced two cases:
+
+- A NaN prediction gets rank zero because every score comparison returns false. That counts as a hit at every cutoff, so the checkpoint reports perfect recall.
+- The target score is calculated separately from the candidate scores. A tiny rounding difference can exclude the target from its own rank count. In the reproduction, rank 11 counted as a recall@10 hit.
+
+I’d reject nonfinite scores and read each target’s score directly from its column in the candidate score matrix. That requires carrying `receiver_id` through evaluation, where it identifies the target column. We can preserve the current tie rule, which counts all candidates tied with the target, and test both cases with a small known example. Batch coverage and validation sampling can stay separate findings.
+
+
+Q:
+
+› I don't get it. It is a two separate problems?
+
+
+A:
+
+• Yes. They’re two independent bugs in the same rank calculation.
+
+1. **Invalid scores.** If the target score is `NaN`, every comparison against it is false. The code counts zero candidates and treats rank `0` as a hit. The fix is to reject nonfinite scores before ranking.
+2. **Rounding with valid scores.** The code computes the target’s score separately from its score in the candidate matrix. If the separate calculation rounds slightly higher, the target can fail the comparison against itself. With ten candidates ahead of it, the code then counts `10` instead of `11`. The fix is to use the target’s score from the candidate matrix itself.
+
+Fixing either one leaves the other possible. We can handle them separately if you prefer.
+
+
+Q:
+
+› I prefer one-by-one, sure. Explain the 'invalid scores' with example and references to code, please
+
+
+A:
+
+• I’ll pull up the exact lines where a NaN score becomes a counted hit.
+
+• Yes. The first issue is that **a `NaN` score can count as a successful prediction** and inflate recall.
+
+In `calculate_metrics`, the code computes a score for each candidate and a separate score for the correct target. It then counts how many candidates score at least as high as the target. That count is used as the target’s rank. [train.py](/workspace/data/ml/gyml/online/train.py:97)
+
+For example, if the model produces a prediction containing `NaN`, the calculation can go like this:
+
+```text
+candidate scores   [NaN, NaN, NaN]
+target score       NaN
+scores >= target   [False, False, False]
+rank               0
+```
+
+The recall calculation checks `rank <= k`, so rank `0` counts as a hit at **all three cutoffs**. If every evaluated row behaves this way, the reported recall is `1.0` at 10, 30, and 100. [Recall calculation](/workspace/data/ml/gyml/online/train.py:106)
+
+`rank_checkpoints` already checks that the final metric is finite. By then, the invalid scores have become a finite recall value, so the checkpoint can still win. [Metric check](/workspace/data/ml/gyml/online/checkpoints.py:6) · [Winner selection](/workspace/data/ml/gyml/online/train.py:179)
+
+For this issue, I’d check both candidate and target scores for `NaN` and infinity immediately before the comparison, and fail the evaluation if either contains a non-finite value.
+
+
+Q:
+
+› As I understand it, non-finite values could be produced by model inference? Target should be filtered on data prep. stage?
+
+
+A:
+
+• I’ll trace where the evaluation targets and candidates come from, and check what validation already happens before scoring.
+
+• Yes. The model’s forward pass during evaluation can produce `NaN` or infinity even when the target embeddings are valid. The dot products can also overflow when both inputs are finite. Both cases can corrupt the recall calculation. [Scoring code](/workspace/data/ml/gyml/online/train.py:97)
+
+I’d validate target vectors during **training data preparation**, in `prepare_splits`. That’s where we join the Spark feature dataset with historical GYML embeddings. The joined `vector` is used both as the target for each row and as a candidate for other rows. The current join checks that a matching embedding row exists, but it doesn’t check that the vector is finite. [Dataset join](/workspace/data/ml/gyml/online/train.py:29) · [Batch target](/workspace/data/ml/gyml/online/dataset.py:117) · [Candidate construction](/workspace/data/ml/gyml/online/train.py:88)
+
+I’d **fail early with a clear error** if a joined vector is invalid. If we decide to drop invalid rows, do it before splitting and log how many rows were dropped, since that changes the evaluation population. Either way, keep the score check before ranking to catch failures introduced by the model or by score computation.
+
+
+Q:
+
+› OK, during data prep we will check given vectors and fail with human-readable message. I'm not sure what we shoul do with the model that could produce non-finite values. Probably it is a bad model and we should fail also?
+
+
+A:
+
+• Yes. If the model produces `NaN` or infinity during validation or test, fail the training run. Silently discarding the affected rows or skipping the checkpoint would hide a numerical failure and could make the reported recall misleading.
+
+I’d check three points and give each failure a distinct message:
+
+- **Data preparation** — reject invalid historical vectors before splitting. Include the affected `receiver_id` so the input can be traced.
+- **Model evaluation** — reject non-finite predictions immediately after `model(inputs)`. Include the split, checkpoint or training step, and batch number.
+- **Scoring** — reject non-finite candidate or target scores before ranking. Even finite vectors can overflow in a dot product. If this check fails after the predictions passed, the message should identify scoring as the failing operation.
+
+
+Q:
+
+› OK, lets try it
+
+
+A:
+
+• I’ll add the three checks to gyml-online training and cover each failure path with a focused test.
+
+• Implemented the non-finite value checks in GYML-online training.
+
+- Data preparation rejects invalid historical embeddings used by the dataset before writing any splits. The error includes the affected `receiver_id` and the embedding directory. [Data preparation](/workspace/data/ml/gyml/online/train.py:30)
+- Validation and test abort if model predictions, candidate scores, or target scores contain `NaN` or infinity. The error identifies the failing operation, split, checkpoint, and batch. [Evaluation](/workspace/data/ml/gyml/online/train.py:122)
+
+All 67 targeted tests passed, including the ZIP training smoke test and regression cases for invalid embeddings, `NaN` predictions, and score overflow. The finite-score rounding issue remains open for the next review step.
+
+
+Q:
+
+› OK, good. Second problem?
+
+
+A:
+
+• I’ll pull up the scoring lines and show how a finite score can move a target across a recall cutoff.
+
+• The second problem is that **a target ranked 11th can be counted as a hit at Recall@10**, even when every score is finite.
+
+The correct target is already in the candidate list. The code scores all candidates with `predictions @ candidates.T`, then recomputes the target’s score separately with `torch.sum(predictions * targets)`. Those operations can round the same dot product differently. [Scoring code](/workspace/data/ml/gyml/online/train.py:134)
+
+For example, suppose 10 candidates score above `0.50000006`, the target’s score in the candidate matrix is `0.50000000`, and every other candidate scores below it. The target is 11th. If the separate calculation rounds the target score up to `0.50000006`, only 10 candidates meet the comparison threshold. The target’s own column falls below that threshold, and the code reports rank 10. [Rank and recall calculation](/workspace/data/ml/gyml/online/train.py:139)
+
+I’d carry `receiver_id` through evaluation batching, map it to its candidate column, and read the target score directly from that column. That keeps the existing tie rule and gives us a straightforward regression test at the Recall@10 boundary. [Candidate construction](/workspace/data/ml/gyml/online/train.py:115)
+
+
+Q:
+
+› I don't get it, what the consequences? It not sounds too bad, why not just ignore it?
+
+
+A:
+
+• Yes, I think we can defer it. We reproduced a recall error in a boundary case. We haven’t measured how often it happens on real data or shown that it changes which checkpoint wins.
+
+The practical consequence is that one example can count as a hit or miss incorrectly. Checkpoint selection uses Recall@30 by default, so the rank-11 example doesn’t affect selection. The equivalent case at rank 31 could matter if two checkpoints are close enough that a few examples decide the winner.
+
+I’d keep it as a low-priority correctness issue. The non-finite score bug we just fixed could make an entirely broken model report perfect recall. This one matters when rounding changes which side of a cutoff a target lands on.
+
+
+Q:
+
+› OK, mark it as low priority task. Next?
+
+
+A:
+
+• I’ll mark the rounding issue as low priority in the review notes and check the next finding against the current code.
+
+• Marked the finite-score rounding issue **P3, deferred** in the review notes. [Finding 9b](/workspace/data/MLDE-654-review.md:143)
+
+**Next is finding 10.** Validation and test use the same batch generator as training, and it drops the last partial batch. With a batch size of 64, evaluation scores only 64 of 65 examples. With 63 examples, it produces no batches and crashes at `torch.cat`. These are counts **after game sampling**, so setting the split row count to a multiple of 64 doesn’t guarantee full batches. [Batch generator](/workspace/data/ml/gyml/online/dataset.py:126) · [Recall calculation](/workspace/data/ml/gyml/online/train.py:124)
+
+I’d make the batch policy explicit. Training would keep using full batches because its loss uses other examples in the batch as negatives. Validation and test would score the partial batch and raise a clear error if sampling produces zero examples.
+
+
+Q:
+
+› OK, give it a go
+
+
+A:
+
+• I’ll make evaluation keep the last partial batch, preserve full batches for training, and test both the partial and empty evaluation cases.
+
+• Validation and test now score the final partial batch. If game sampling produces zero evaluation examples, training fails with an error that names the split and checkpoint. Training still uses full batches to preserve its in-batch negative sampling. [Evaluation code](/workspace/data/ml/gyml/online/train.py:125)
+
+Marked finding 10 resolved. All 70 targeted tests passed, including the regression cases with 63, 65, and zero evaluation examples. [Review notes](/workspace/data/MLDE-654-review.md:152)
+
+
+Q:
+
+› OK, commited. Next?
+
+
+A:
+
+• I’ll check the next finding against the committed code before proposing a fix.
+
+• **Finding 11 [P2] is about comparing checkpoints on different validation examples.** Each validation pass samples games again using Python’s `random.sample`. For a row with five eligible games and a limit of three, checkpoint A might be scored on games 1, 2, and 3, while checkpoint B sees games 2, 4, and 5. A checkpoint can miss the shortlist because it drew harder examples. The test stage already fixes the sample across finalists, but it only sees checkpoints that made the shortlist. [Game sampling](/workspace/data/ml/gyml/online/dataset.py:74) · [Checkpoint selection](/workspace/data/ml/gyml/online/train.py:199)
+
+I’d give each evaluation pass its own Python RNG, initialized from the existing configured seed. Every checkpoint would then see the same sampled games **within each split**. This works for both validation and test, removes the need to reset global RNG state during test selection, and leaves training free to resample as it does today. I’d add a regression test that verifies two checkpoints receive identical evaluation inputs.
+
+
+Q:
+
+› Interesting bug. OK, give it a go
+
+
+A:
+
+• I’ll make validation and test use a fresh RNG seeded from the existing config, then verify that checkpoints see identical sampled inputs.
+
+• Validation and test now start each evaluation pass with a fresh Python RNG initialized from the configured seed. Every checkpoint sees the same sampled games within each split, and evaluation leaves the training sampler’s random state alone. [Evaluation code](/workspace/data/ml/gyml/online/train.py:126)
+
+Marked finding 11 resolved. All 72 targeted tests passed, including regression tests that verify the sampled games match across checkpoints in both splits. [Review notes](/workspace/data/MLDE-654-review.md:160)
+
+
+Q:
+
+› OK, commited. Next?
+
+
+A:
+
+• I’ll check how the service pipeline fetches the ML ZIP and what happens if the dev package changes between jobs.
+
+• **Finding 12 [P3] is a race on the shared `-dev` ML ZIP.** `test-code`, `test-image`, and `deploy-service` each download it from the same S3 key. If someone republishes that key after `test-code` passes, the deploy job can build an image with a different ZIP. The deploy job still smoke-tests the image it pushes, including an inference request, but the full endpoint suite may have run against different code. [CI jobs](/workspace/data/gyml_online/.gitlab-ci.yml:55) · [ZIP download](/workspace/data/gyml_online/.ci/prepare_artifacts.sh:26) · [Smoke test](/workspace/data/gyml_online/.ci/build_service_image.sh:96)
+
+If we fix it, I’d download the ZIP once in a small GitLab job, using `versions.yaml` as today, and pass it to all three jobs as a pipeline artifact. The two test jobs can still run in parallel. Given the existing smoke test and the production publisher’s guard against reusing version prefixes, I’d also be comfortable deferring this. [Production publish guard](/workspace/data/ml/.gitlab-ci.yml:59)
+
+
+Q:
+
+› It is the price of convinience. In prod we use only immutable artifacts, no problem there. In dev we need to give to devs some freedom. And freedom is never free (pun intended :).
+
+
+A:
+
+• I’ll record the mutable dev ZIP as an accepted trade-off in the review notes.
+
+• Marked finding 12 as accepted. Dev keeps the freedom to republish the shared ZIP, and the deploy job smoke-tests the image it actually publishes. Production uses immutable artifacts. [Review notes](/workspace/data/MLDE-654-review.md:168)
+
+
+Q:
+
+› OK, next?
+
+
+A:
+
+• I’ll check how the ECS rollout script handles a rollback and where the timeout comes from.
+
+• **Finding 13 [P3] is about how CI reports an ECS rollback.** Both service templates enable automatic rollback. If revision 42 fails and ECS restores revision 41, `aws ecs wait services-stable` can succeed because revision 41 is healthy. The script then checks for revision 42. If ECS has already removed that deployment from the response, the script can spend another five minutes waiting and report a timeout. CI still fails correctly. The operator gets a less useful diagnosis. [Rollout script](/workspace/data/gyml_online/.ci/update_ecs_service.sh:63) · [AWS stability waiter](https://docs.aws.amazon.com/cli/latest/reference/ecs/wait/services-stable.html) · [AWS rollback behavior](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
+
+I’d keep the waiting behavior and make the failure message show **the requested revision, the active revision, and recent ECS events**. That gives the operator enough context to spot a rollback. Failing immediately on the first revision mismatch would require distinguishing a rollback from an early poll that still shows the previous revision.
+
+
+Q:
+
+› Sounds goot, give it a go
+
+
+A:
+
+• I’ll add the requested and active revisions plus recent ECS events to the failure output, keeping the existing wait behavior.
+
+• ECS rollout failures now report the requested task definition, the current primary task definition, and recent ECS events when available. The existing wait behavior and success criteria are preserved. Finding 13 is marked resolved. [Rollout script](/workspace/data/gyml_online/.ci/update_ecs_service.sh:65) · [Review notes](/workspace/data/MLDE-654-review.md:178)
+
+`bash -n` and five mocked scenarios passed, covering success, rollout failure, timeout after rollback, and waiter failure with and without diagnostics. Verification used mocked AWS responses.
+
+
+Q:
+
+› OK, approved. Next?
+
+
+A:
+
+• I’ll check the review notes for anything still open.
+
+• All numbered findings have a disposition. The last code follow-up is a small cleanup in the training dataset generator. [Review notes](/workspace/data/MLDE-654-review.md:186)
+
+`gen_prepare_dataset` opens three vocabulary files on every pass, though only one is needed to encode the sampled `game` for the selected mode. It also encodes the user’s full `games_added` list for every example, and the batch builder discards that field. [Dataset generator](/workspace/data/ml/gyml/online/dataset.py:65) · [Batch builder](/workspace/data/ml/gyml/online/dataset.py:134)
+
+I’d load only the vocabulary selected by `flag_games_intersected` and remove the unused list from the yielded example. Profile games would still feed the sampled `game` in non-intersected mode. This simplifies the code and removes unnecessary work. Any training speedup is unmeasured.
+
+
+Q:
+
+› I would left all three files, for ease of debugging, wouldn't you agree?
+
+
+A:
+
+• Yes, I’d keep generating all three vocabulary files. They’re useful for comparing request games, profile games, and intersected games when debugging.
+
+My proposed cleanup is limited to the batch generator. It can read the one vocabulary selected by `flag_games_intersected` and stop encoding the full `games_added` list that the batch builder discards. All three files would still be available for inspection.
+
+
+Q:
+
+› OK, lets do this
+
+
+A:
+
+• I’ll simplify vocabulary loading in the batch generator and verify that both training modes still produce all three vocabulary files.
+
+• Training still generates all three vocabulary files for debugging. The batch generator now reads only the vocabulary selected by `flag_games_intersected` and encodes only the sampled game. Non-intersected mode still samples from the user’s profile games. [Dataset generator](/workspace/data/ml/gyml/online/dataset.py:65)
+
+All 72 targeted tests passed, including checks that both modes generate all three files and load only the selected one. Marked the review follow-up resolved. [Review notes](/workspace/data/MLDE-654-review.md:193)
+
+
+Q:
+
+› Good. Next?
+
+
+A:
+
+• I’ll check the review notes for anything still open before we wrap up.
+
+• The code review is complete, and the working tree is clean. The finite-score rounding issue remains deferred as P3. All other findings were fixed, documented, or accepted. [Review notes](/workspace/data/MLDE-654-review.md:31)
+
+The next meaningful check is a final **develop E2E run from the release tag**. The earlier run passed before the review fixes, so this would verify the code and artifacts that will actually be released.
+
+The branch diff check also flagged trailing whitespace in four Markdown files. That’s minor pre-merge cleanup.
+
+
+Q:
+
+› Perfect! I still have one concern though. In train and inference (gyml/online) we have two classes for one model. ColdModel and Model if I remember right. Yes?
+
+
+A:
+
+• I’ll check how `ColdModel` and `Model` relate and where each is used.
+
+• Yes. There are two classes and one neural network implementation.
+
+- **`ColdModel`** defines the PyTorch layers and forward pass. Training instantiates it directly and exports its weights. [Architecture](/workspace/data/ml/gyml/online/model.py:6) · [Training export](/workspace/data/ml/gyml/online/train.py:255)
+- **`Model`** is the serving wrapper. It loads the metadata and weights into a `ColdModel`, turns request features into tensors, calls the network, and returns the embedding. [Serving wrapper](/workspace/data/ml/gyml/online/inference.py:23)
+
+So training and serving share the same architecture. The name `Model` hides that distinction a little.
+
+
+Q:
+
+› Do we really need both classes? Could we simpify our design by merging both classes into one?
+
+
+A:
+
+• We could merge them, but I’d keep both. The network is already shared. `ColdModel` owns the PyTorch layers and batched tensor computation. The serving `Model` owns the `Model(model_dir).inference(features)` contract, including artifact loading, feature encoding, and inference noise. [Network](/workspace/data/ml/gyml/online/model.py:6) · [Serving wrapper](/workspace/data/ml/gyml/online/inference.py:23)
+
+A single class would still need two construction paths: initialize a fresh network for training, or load weights, metadata, and a game dictionary for serving. It would also expose `inference(features)` on a freshly initialized training model, which lacks the serving state that method needs. The wrapper keeps that distinction clear and lets the service use the model without knowing how PyTorch or the artifact format works.
+
+The confusing part is the naming. I’d keep the current public `Model` contract and treat `ColdModel` as the network it wraps.
+
+
+Q:
+
+› I think it will be better if we rename Model to ModelWrapper?
+
+
+A:
+
+• Yes, I’d rename it to `ModelWrapper`. The name makes it clear that the class handles the serving interface and delegates the forward pass to `ColdModel`.
+
+It’s a Python API rename. We’d update the service import, tests, and documentation together. The HTTP API and existing model artifacts would still work as before.
+
+
+Q:
+
+› OK, make it happen, please
+
+
+A:
+
+• I’ll rename the serving class to `ModelWrapper`, update its callers and docs, and run the inference and service checks.
+
+• Renamed the GYML-online serving class to `ModelWrapper` and updated the service, synthetic model script, tests, and docs. The HTTP API and model artifact format are unchanged. [Inference wrapper](/workspace/data/ml/gyml/online/inference.py:23)
+
+All 72 targeted ML tests and all 5 service endpoint tests passed. The service tests loaded `ModelWrapper` from a freshly built ML ZIP.
+
+For deployment, the ML ZIP pinned in `gyml_online/versions.yaml` must contain `ModelWrapper`.
+
+
+Q:
+
+› Perfect! Now, remind me, do we have skill for creating gitlab merge-request descriptions?
+
+
+A:
+
+• I’ll check the installed skills and repository guidance for a merge-request description skill.
+
+• No dedicated GitLab merge-request description skill is installed or checked into this repository. We’ve used a convention in past sessions: write the description in Russian and provide three versions—short, medium, and full.
+
+
+Q:
+
+› OK, use that convention and extend it in this way: in full description should be listed: what is new (added), what is deleted, what is changed. Probably we should add a skill for that
+
+
+A:
+
+• I’ll draft the three Russian descriptions for this MR and use the skill-creator skill to save the convention for future reviews.
+
+• Added and validated the local [gitlab-mr-description skill](/home/dev/.codex/skills/gitlab-mr-description/SKILL.md). It records the three Russian formats and requires **Добавлено**, **Удалено**, and **Изменено** in the full version.
+
+Below are the drafts for **MLDE-654** against `develop`.
+
+## Краткое описание
+
+Добавлен DAG `gyml_online_train`, который собирает данные в EMR, обучает модель на EC2 и запускает деплой в ECS через GitLab CI. Обучение публикует веса и метаданные модели в S3. Сервис использует `ModelWrapper` из версионированного ML ZIP вместо собственной реализации инференса.
+
+## Оптимальное описание
+
+Автоматизирован цикл подготовки, обучения и деплоя модели GYML Online. DAG `gyml_online_train` принимает `run_dth` и список этапов, проверяет готовность источников и запускает сбор данных в EMR. Обучение на EC2 использует подготовленный Parquet и эмбеддинги GYML GNN, выбирает чекпойнт по метрикам и публикует в S3 `model_state.pth` и `metadata.yaml`.
+
+GitLab CI собирает образ с выбранной моделью и ML ZIP из `gyml_online/versions.yaml`, проверяет `/version`, `/health` и инференс, затем обновляет ECS-сервис. В `develop` используется один сервис, в `prod` целевой сервис определяется сплитом `control` или `treatment`. Прежняя реализация инференса внутри сервиса удалена. Код и конфигурация запуска обучения вынесены в общие для двух GYML DAG компоненты.
+
+## Полное описание
+
+Автоматизировать подготовку данных, обучение и деплой GYML Online. Версии кода для обучения и инференса задаются явно, а модель идентифицируется парой `index_id` и `index_id_online`.
+
+### Добавлено
+
+- Ручной DAG `gyml_online_train` с этапами `data_collect`, `train` и `deploy`. При запуске оператор задаёт `run_dth` в UTC, нужные этапы, окружение и сплит.
+- PySpark-джоба `gyml_online_prepare_dataset` и конфигурация `gymlOnlinePrepareDatasetJob.yaml`. Джоба собирает признаки, пишет Parquet и промежуточные чекпойнты в S3 с разбивкой по модели и часу.
+- Обучение в `ml/gyml/online` с конфигурацией Hydra. По умолчанию в финальный отбор попадают пять лучших промежуточных чекпойнтов по validation Recall@30 и последний чекпойнт. Победитель выбирается по test Recall@30. В S3 публикуются `model_state.pth` и `metadata.yaml`.
+- Локальное `uv`-окружение сервиса и проверка на синтетической модели. Скрипты воспроизведения исходного ноутбука сохранены в `research/gyml/online/scripts/`.
+
+### Удалено
+
+- Собственная реализация инференса в `gyml_online/app/inference/main.py`.
+- Прежние правила запуска CI для `gyml_online` по изменениям файлов и ручного деплоя в `develop`.
+
+### Изменено
+
+- GYML GNN и GYML Online используют общие настройки EC2 и общий механизм запуска обучения с отдельными обёртками для каждой модели.
+- Сервис загружает `ModelWrapper` из ML ZIP, версия которого берётся из `gyml_online/versions.yaml`. GitLab CI запускается из Airflow по Git-тегу, проверяет артефакты и образ, затем подтверждает стабилизацию ECS на запрошенной ревизии. В `prod` повторная публикация существующего тега образа отклоняется.
+- При оценке модели все чекпойнты получают одинаковую выборку игр внутри каждого сплита. Последний неполный батч учитывается, а некорректные эмбеддинги и нечисловые или бесконечные оценки останавливают запуск.
+
+**Проверка.** Сквозной запуск в `develop` прошёл до финальных правок по ревью. После правок прошли 72 целевых ML-теста и 5 тестов HTTP-эндпоинтов со свежесобранным ML ZIP.
+
+
+Q:
+
+› Thanks, excellent work today. Export today’s session, please
+
+
+A:
+
+• I’ll use the export-session-dialog skill to save today’s conversation as a Q/A Markdown file.
