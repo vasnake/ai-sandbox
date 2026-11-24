@@ -3049,3 +3049,885 @@ Q:
 A:
 
 • I’ll use the export-session-dialog skill to save today’s conversation as a Q/A Markdown file.
+
+## 2026-11-24 code review
+
+Q:
+
+› Hi, today we will be working on code review for gitlab merge-request for branch 'feature/MLDE-660-tribe-chat-moderation'. Remind me our basic principles for code review, please
+
+
+A:
+
+• For `feature/MLDE-660-tribe-chat-moderation`, we’ll use these review principles:
+
+1. **Start with the merge-base diff.** Confirm the MR’s target branch, run `git diff <target>...feature/MLDE-660-tribe-chat-moderation`, and list the changed components.
+2. **Read the project guidance.** Check each affected project’s README and `AGENTS.md`. Verify the documented behavior against the source, the root `.gitlab-ci.yml`, and the relevant child pipelines.
+3. **Trace contracts across components.** Check configuration keys, job classes and arguments, task IDs, input and output schemas, artifact paths, and runtime dependencies.
+4. **Lead with actionable findings.** Prioritize correctness and regressions, then review simplicity, readability, duplication, testability, and performance. Give each finding a file location and a concrete impact. Distinguish confirmed defects from external prerequisites and optional improvements, and qualify unmeasured performance claims.
+5. **Validate in the project’s declared environment.** Run relevant checks and report what passed, what could not run, and any material differences from the deployment runtime. Keep tracked files unchanged unless edits are requested.
+
+We’ll honor prerequisites already confirmed in the session. Missing external schemas or infrastructure definitions alone don’t establish a defect. Unused-code audits require an explicit request, and version and changelog updates belong to the release step after the feature merges into `develop`.
+
+
+Q:
+
+› OK, lets start
+
+
+A:
+
+• I’ll check the branch and merge-base diff first, then trace the affected jobs through their configuration and CI.
+
+• The diff spans the chat scoring adapter and two Airflow changes. I’m using `origin/develop` as the comparison target because GitLab did not expose the MR metadata. I also found that the existing deployment commits Kafka offsets before scoring and stores pending work in Redis, so I’ll check how the new version handles that backlog during rollout.
+
+• All 30 adapter tests pass. Separate checks reproduced two cases where the service returns an empty moderation result: an LLM response missing `violations`, and a flagged message missing its ID. I’ll finish checking the Airflow task wiring and how the sensor behaves on newly created topics.
+
+• I’d hold the merge until the private-chat rollout accounts for pending Redis requests. All 30 adapter tests passed, but targeted checks found three additional failure cases.
+
+Reviewed `feature/MLDE-660-tribe-chat-moderation` at `a5b6d9a4` against the merge base with `origin/develop`. I used `origin/develop` as the target because GitLab did not expose the MR metadata. The diff covers the chat scoring adapter and its ECS pipeline, two Airflow event models, and a `plus_pack_gift` CDC entry.
+
+### Findings
+
+1. **P1 · The rollout can strand private-chat requests already committed to Kafka.** The current adapter commits a request’s Kafka offset after writing it to Redis, before scoring finishes. The new adapter uses the same consumer group and removes Redis recovery. Any request still pending in Redis when the old task stops will be skipped by the new task. Add a cutover step that stops the old task from taking new work and drains its Redis backlog, or provide a replay path. [Consumer group](/workspace/data/chat-scoring-adapter/app/config/app-parameters-prod.yaml:18) · [Deployment job](/workspace/data/chat-scoring-adapter/.gitlab-ci.yml:81)
+2. **P2 · An LLM response missing `violations` is reported as a successful moderation result.** I reproduced this through the fallback path with `{}` and `{"label":"clean"}`. Both returned an empty violations list, so the worker would publish `SUCCESS` and commit the request offset. Require the `violations` field while allowing an explicit empty list. [LLM result schema](/workspace/data/chat-scoring-adapter/app/service/data_models.py:143) · [Fallback parser](/workspace/data/chat-scoring-adapter/app/service/score_service.py:151)
+3. **P2 · Tribe requests can silently drop a valid violation when the flagged message has no ID.** The shared request model accepts messages without `id`. If the LLM correctly flags such a message, the mapper discards it and can return `SUCCESS` with zero violations. Validate that every message marked for checking has a nonempty ID in tribe mode. [Request schema](/workspace/data/chat-scoring-adapter/app/service/data_models.py:38) · [Violation mapping](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:135)
+4. **P2 · An empty partition can fail the hourly Airflow DAG before the first event arrives.** The new task groups use a sensor that raises when the Kafka-to-S3 group has no committed offset. I reproduced the failure with an empty partition whose low and high watermarks were both zero. Handle empty partitions before requiring a committed offset, while continuing to wait on partitions that contain unread records. [New task groups](/workspace/data/airflow/dags/dwh/events__hourly.py:115) · [Sensor check](/workspace/data/airflow/dags/extentions/kafka/operators.py:169)
+
+### Validation
+
+All 30 adapter tests passed on Python 3.13. The Airflow 2.10.3 DAG loaded locally on Python 3.11.15, and both Kafka sensor-to-dbt dependencies matched the expected topics and task IDs. The CDC YAML, deployment shell syntax, and `git diff --check` passed. Black flagged one formatting change in [app_services.py](/workspace/data/chat-scoring-adapter/app/service/app_services.py:32).
+
+Docker was unavailable, so the CI image smoke tests and Kafka integration tests remain unverified. Live ECS, OpenRouter, and warehouse execution were outside the local checks. The review made no changes to tracked files.
+
+
+Q:
+
+› Great! Lets create a report in file 'MLDE-660-tribe-chat-moderation.review.md'. For each problem maintain stable ID for future references. Also add references (links) to code where problem is found. Leave a placeholders for 'notes' and 'status', where notes is a place for future comments and notes, and status is a mark like 'fixed', 'pending', etc. OK?
+
+
+A:
+
+• I’ll write the review report at the repository root with stable finding IDs, code links, and editable status and notes fields.
+
+• Created [MLDE-660-tribe-chat-moderation.review.md](/workspace/data/MLDE-660-tribe-chat-moderation.review.md). The four findings have stable IDs (`MLDE-660-01` through `MLDE-660-04`), an initial status of `pending`, and a notes placeholder.
+
+I verified all 11 commit-pinned code references against the local Git history.
+
+
+Q:
+
+› Cool, thanks! The goal of this MR is adding a new AWS ECS service that uses external LLM service to score 'tribe chats'. Tell me, is the goal achieved?
+
+
+A:
+
+• **Yes, the MR implements the new ECS service for tribe-chat scoring.** `tribe-chat-scoring-adapter` has its own image, ECS task definition, Kafka topics, and consumer group. It sends chat transcripts to an external LLM through OpenRouter and publishes violations tied to individual message IDs. The CI pipeline is wired to build and deploy it separately from the private-chat service.
+
+**Production readiness is still open.** The 30 adapter tests passed locally, but live ECS-to-Kafka-to-OpenRouter execution remains unverified. Findings `MLDE-660-02` and `MLDE-660-03` show that the new service can report success with an empty violations list when scoring output or message IDs are missing. `MLDE-660-01` is the merge blocker I’d address first because the same rollout can strand pending **private-chat** requests. [Review report](/workspace/data/MLDE-660-tribe-chat-moderation.review.md)
+
+
+Q:
+
+› OK, got it. Now, give me a description: what components added, removed, and changed in this MR?
+
+
+A:
+
+• I’ll check the merge-base diff for the component inventory, including the removed dependencies and local development services.
+
+• The MR adds **a second ECS service for tribe-chat moderation** and **replaces the request-processing pipeline shared by both the new service and the existing private-chat service**. It also adds Airflow ingestion for tribe scoring events and a separate CDC table entry.
+
+### Added
+
+- **Tribe-chat ECS service.** `tribe-chat-scoring-adapter` runs from the shared adapter code with its own dev and prod configs, image tag, ECS task definition family, Kafka request and response topics, and consumer group. [Service variant configuration](/workspace/data/chat-scoring-adapter/.ci/service_variant.sh)
+- **Tribe scoring mode.** A new prompt and scoring task send chat transcripts to OpenRouter. Earlier messages provide context, while checked messages can yield violations with a suspect ID, message IDs, category, confidence, and reasoning. [Scoring tasks](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py)
+- **Airflow ingestion.** The hourly events DAG gains two task groups that wait for the tribe scoring request and response topics, then run their corresponding dbt models. The production PostgreSQL history config also adds `plus_pack_gift`. [Hourly DAG](/workspace/data/airflow/dags/dwh/events__hourly.py:115) · [CDC config](/workspace/data/airflow/dags/batch/imports/postgres_history/config_production.yaml:70)
+- **Tests and research tooling.** New tests cover tribe scoring, configuration, request processing, and offset tracking. An A/B runner scores prepared requests and fills a CSV review table. [Adapter tests](/workspace/data/chat-scoring-adapter/app/tests) · [A/B runner](/workspace/data/chat-scoring-adapter/research/run_tribe_ab.py)
+
+### Removed
+
+- **Redis queueing and recovery.** The adapter drops the Redis-backed request queue, startup recovery from Redis, and `Redis*` settings. It also removes the `redis` and `fakeredis` dependencies and the Redis and RedisInsight containers from local Compose. [Dependencies](/workspace/data/chat-scoring-adapter/pyproject.toml) · [Local Compose](/workspace/data/chat-scoring-adapter/local-dev-svc/docker-compose.yaml)
+- **Batch processing.** Batch assembly, batch result handling, `BatchSize`, and `MaxPendingTimeSec` are removed. `MaxConcurrentRequests` replaces `MaxConcurrentBatches`. [Application configuration](/workspace/data/chat-scoring-adapter/app/service/app_services.py)
+
+### Changed
+
+- **Kafka processing for both modes.** Requests are scored individually with bounded concurrency. The worker sends the response before committing the request offset, and `OffsetTracker` prevents commits from advancing past unfinished requests in the same partition. Private chats still produce one classification per chat. [Worker](/workspace/data/chat-scoring-adapter/app/service/main.py:123) · [Offset tracker](/workspace/data/chat-scoring-adapter/app/service/offset_tracker.py)
+- **CI and release artifacts.** GitLab builds, smoke-tests, and deploys separate `chat` and `tribe` variants through shared scripts. The private-chat image tag changes from `service-<version>` to `chat-scoring-service-<version>`, and the service version moves from `0.1.1` to `0.2.0`. [GitLab CI](/workspace/data/chat-scoring-adapter/.gitlab-ci.yml) · [Version manifest](/workspace/data/chat-scoring-adapter/versions.yaml)
+
+
+Q:
+
+› Perfect, add this as preamble to our review doc, please
+
+
+A:
+
+• I’ll add the component overview before the findings and keep the existing finding IDs, statuses, and notes fields in place.
+
+• Added the **Added / Removed / Changed** component overview before the findings in the [review report](/workspace/data/MLDE-660-tribe-chat-moderation.review.md:5). Verified all 13 new code links against the reviewed commit and preserved the four finding IDs, statuses, and notes fields.
+
+
+Q:
+
+› OK, thanks. Tell me, how gitlab ci/cd should update scoring services now? What changes in ci/cd?
+
+
+A:
+
+• GitLab now builds and deploys **two ECS scoring services from the same adapter code**. `SERVICE_VARIANT` selects the configuration, image tag, ECS service name, and task definition family for each job. [Variant selection](/workspace/data/chat-scoring-adapter/.ci/service_variant.sh)
+
+| Variant | ECS service | ECR image tag | ECS task definition family |
+|---|---|---|---|
+| `chat` | `chat-scoring-adapter` | `chat-scoring-service-<version>` | `chat-scoring-service-<env>` |
+| `tribe` | `tribe-chat-scoring-adapter` | `tribe-chat-scoring-service-<version>` | `tribe-chat-scoring-service-<env>` |
+
+Both variants use the existing `chat-scoring-adapter` ECR repository and the same version from `versions.yaml`. Development image tags get a `-dev` suffix. The private-chat image tag previously used the `service-<version>` prefix. [Build script](/workspace/data/chat-scoring-adapter/.ci/build_service_image.sh) · [Version manifest](/workspace/data/chat-scoring-adapter/versions.yaml)
+
+1. **Test.** When adapter changes trigger the child pipeline, `test-code` runs the shared Python suite once. Two parallel `test-image` jobs build and smoke-test the `chat` and `tribe` images without pushing them. These jobs use the development configs by default, including in a `main` pipeline. [Root pipeline](/workspace/data/.gitlab-ci.yml) · [Adapter test jobs](/workspace/data/chat-scoring-adapter/.gitlab-ci.yml:41)
+2. **Build and push.** After tests pass, the two deploy jobs run automatically on `main`. In `develop` and merge-request pipelines, development deploys are manual. Each job selects the config for its variant and environment, rebuilds and smoke-tests the image, then pushes it to ECR. The production build stops if its versioned tag already exists. [Deploy jobs](/workspace/data/chat-scoring-adapter/.gitlab-ci.yml:56) · [Build script](/workspace/data/chat-scoring-adapter/.ci/build_service_image.sh)
+3. **Update ECS.** Each deploy job registers a task definition revision pointing at its image. It creates the ECS service if missing, then calls `update-service` to roll out that revision. On the first rollout, this updates the existing private-chat service and creates the tribe service. The script checks that ECS accepted the revision but does not wait for the service to stabilize. [ECS update script](/workspace/data/chat-scoring-adapter/.ci/update_ecs_service.sh)
+
+The first rollout has two prerequisites: provision the tribe Kafka topics and drain or replay the private-chat Redis backlog before replacing the old task. The deployment jobs do not perform either step. [Deployment prerequisites](/workspace/data/chat-scoring-adapter/README.md:175) · [Review finding MLDE-660-01](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-01)
+
+
+Q:
+
+› so, code changes trigger the pipeline, and that pipeline updates two ecs services?
+
+
+A:
+
+• Yes. A change under `chat-scoring-adapter/` triggers its GitLab child pipeline, which tests both variants. After the tests pass on `main`, two deploy jobs run automatically. One updates `chat-scoring-adapter`, and the other creates or updates `tribe-chat-scoring-adapter`. On `develop` and in merge-request pipelines, the two development deploy jobs are manual.
+
+
+Q:
+
+› Got it, thanks. Is there documentation that explain ci/cd?
+
+
+A:
+
+• Yes. The adapter README has a [Deploy section](/workspace/data/chat-scoring-adapter/README.md:154) that explains the CI/CD flow, when deployments run automatically or manually, how the two service variants are built, and what needs to be provisioned before the first tribe deployment.
+
+For the exact job rules and commands, see the [root GitLab pipeline](/workspace/data/.gitlab-ci.yml), the [adapter child pipeline](/workspace/data/chat-scoring-adapter/.gitlab-ci.yml), and the [ECS update script](/workspace/data/chat-scoring-adapter/.ci/update_ecs_service.sh).
+
+
+Q:
+
+› Lets discuss code quality: DRY, KISS, readability, modularity and testability, etc. Any problem there?
+
+
+A:
+
+• I’ll look for concrete maintainability issues in the shared worker, scoring modes, and deployment scripts, including what the tests actually exercise.
+
+• Yes. The split between `ChatScoringTask` and `TribeScoringTask` is a good modular boundary. Each mode owns transcript formatting and result mapping, while both reuse the OpenRouter client and retry logic. Removing Redis and batching also makes the normal request path easier to follow. I’d keep that structure. [Scoring tasks](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:41)
+
+I found four concrete issues, in priority order:
+
+1. **Concurrency and KISS · Request tasks can outlive the worker that owns them.** The reader tracks request tasks, but only waits for them when the input iterator ends normally. When one request fails, `process_messages()` cancels the reader and starts unwinding before its sibling tasks finish. I reproduced a sibling publishing a Kafka response after `process_messages()` had already raised. Give the worker explicit ownership of its request tasks and cancel and await them before closing clients. An `asyncio.TaskGroup` is one way to simplify that lifecycle. [Worker shutdown](/workspace/data/chat-scoring-adapter/app/service/main.py:104) · [Request tasks](/workspace/data/chat-scoring-adapter/app/service/main.py:123)
+2. **CI testability · The image smoke test can pass when startup fails.** It checks for a log line emitted before the scoring mode is validated. I ran the entry point with an invalid mode and confirmed that it printed the success marker the script looks for, then exited with code 1. A config validation step inside each built image would check the variant’s packaged config without needing live Kafka or OpenRouter. [Startup](/workspace/data/chat-scoring-adapter/app/service/main.py:42) · [Smoke test](/workspace/data/chat-scoring-adapter/.ci/build_service_image.sh:60)
+3. **Test coverage · The tribe tests use the default private-chat prompt.** The fixture sets `scoring_mode: tribe` and leaves `prompt_name` at the private-chat default. The HTTP mock checks the transcript, so the test still passes. The config tests also check that the prompt and mode resolve independently, which lets a valid but mismatched pair pass. Load the shipped tribe config in the fixture and assert the system prompt sent to OpenRouter. [Test fixture](/workspace/data/chat-scoring-adapter/app/tests/conftest.py:26) · [Config test](/workspace/data/chat-scoring-adapter/app/tests/test_config.py:37) · [HTTP assertion](/workspace/data/chat-scoring-adapter/app/tests/test_tribe.py:162)
+4. **DRY · Build and deploy independently calculate the same ECR image reference.** Both scripts derive the version, `-dev` suffix, repository, and tag. A change in just one script could make ECS reference a different image from the one CI pushed. Resolve the image reference in the shared variant script, or pass the built reference to the deploy step. [Build script](/workspace/data/chat-scoring-adapter/.ci/build_service_image.sh:17) · [Deploy script](/workspace/data/chat-scoring-adapter/.ci/update_ecs_service.sh:21)
+
+All 30 adapter tests still pass. I’d prioritize the shutdown fix and its two-request regression test, then make the image and prompt tests verify the actual variant configuration.
+
+
+Q:
+
+› Wonderful! Add those findings to our review doc, please
+
+
+A:
+
+• I’ll append the four code-quality findings as `MLDE-660-05` through `MLDE-660-08`, using the same status, notes, and commit-pinned links as the existing findings.
+
+• Added `MLDE-660-05` through `MLDE-660-08` to the [review report](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-05). They cover worker shutdown, the image smoke test, tribe prompt coverage, and duplicated ECR image reference logic.
+
+Each finding is marked `pending` with a notes placeholder. I verified all 12 new commit-pinned code links.
+
+
+Q:
+
+› Great! Lets discuss found problems one-by-one. Go
+
+
+A:
+
+• ### MLDE-660-01 · P1 · Pending private-chat requests can be stranded during rollout
+
+The old adapter writes each request to Redis and commits its Kafka offset **before** scoring finishes. The new adapter starts from that same Kafka consumer group’s committed offsets and no longer reads Redis. If ECS stops the old task while a request is still queued or being scored, the new task skips it and the caller may never receive a response.
+
+I’d use a **one-time drain** for the cutover. Pause private-chat request intake, let the old adapter finish and publish its outstanding responses, verify its Redis backlog is empty, then deploy the new adapter and resume intake. The old task needs to stay running during the drain. If intake can’t pause, the rollout needs a way to replay outstanding Redis requests. [Review finding](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-01)
+
+Can private-chat request intake be paused for this rollout?
+
+
+Q:
+
+› I think not, we can't pause the intake. It seems like we have to accept a possibility that some chats will be skipped.
+
+
+A:
+
+• If the team accepts that some private-chat requests may go unanswered, this becomes an **accepted rollout risk**. The exposed requests are those whose Kafka offsets are already committed and whose responses are still outstanding when ECS stops the old task. The size of that backlog at cutover is unknown.
+
+Continuous intake still leaves a migration option. A bridge release could stop the old task from fetching new requests and let it finish the work it already holds, while the new task takes over Kafka consumption. If that extra release isn’t worth the cost, I’d record `MLDE-660-01` as `accepted risk` once the team explicitly agrees to the possible loss.
+
+
+Q:
+
+› Yes, got it. Lets record it as accepted risk
+
+
+A:
+
+• I’ll mark `MLDE-660-01` as `accepted risk` and record the decision to keep private-chat intake running during cutover.
+
+• Marked [MLDE-660-01](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-01) as `accepted risk` and updated the preamble. Private-chat intake will stay open during cutover, and requests still pending in Redis when the old ECS task stops may go unanswered.
+
+### Next · MLDE-660-02 · Missing `violations` is treated as success
+
+The parser currently treats `{}` and `{"violations":[]}` the same way. Both produce `SUCCESS` with zero violations, and the worker commits the Kafka offset. That makes a malformed LLM response indistinguishable from a completed moderation check that found nothing.
+
+I’d make `violations` required while still accepting an explicit empty list. A missing field would then follow the existing retry path and return `FAILED` if retries are exhausted. [Review finding](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-02)
+
+
+Q:
+
+› OK, I need an explanation, why do you think that: "parser currently treats {} and {"violations":[]} the same way"? Give me ref to code and example, please
+
+
+A:
+
+• `TribeLlmResult` defines `violations` with `Field(default_factory=list)`. When the JSON omits the field, Pydantic fills it with `[]`. When the JSON explicitly includes `"violations": []`, Pydantic keeps that value. Both inputs therefore produce the same result. [Result model](/workspace/data/chat-scoring-adapter/app/service/data_models.py:143)
+
+```python
+from service.data_models import TribeLlmResult
+
+for payload in ('{}', '{"violations":[]}'):
+    result = TribeLlmResult.model_validate_json(payload)
+    print(payload, "->", result.model_dump())
+```
+
+```text
+{} -> {'violations': []}
+{"violations":[]} -> {'violations': []}
+```
+
+That is the same `model_validate_json()` call used by the OpenRouter fallback parser. Once validation succeeds, `TribeScoringTask.to_result()` iterates over the empty list and returns a result with zero violations. The response adapter then marks it `SUCCESS`. [Fallback parser](/workspace/data/chat-scoring-adapter/app/service/score_service.py:150) · [Result mapping](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:103) · [Response status](/workspace/data/chat-scoring-adapter/app/service/app_messages.py:93)
+
+
+Q:
+
+› Thanks, got it. OK, we need this service to find violations. If there is none, it is ok to get empty list that way or another. I understand that strict schema would be better, but it not worth it, IMHO
+
+
+A:
+
+• I’ll record `MLDE-660-02` as an accepted risk and note what the current parser behavior means for moderation.
+
+• Marked [MLDE-660-02](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-02) as `accepted risk`. The report records the decision to keep the current parser behavior, including the possibility that a malformed LLM response is counted as a successful empty result.
+
+### Next · MLDE-660-03 · A flagged message can be dropped if its ID is missing
+
+Here the LLM **does find a violation**. The adapter can’t include the flagged message in its Kafka response because the message has no ID, so it drops the reference. If it was the only flagged message, the service returns `SUCCESS` with zero violations. [Review finding](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-03)
+
+The decision hinges on the producer contract. Does the tribe request producer guarantee an ID for every message sent for scoring?
+
+
+Q:
+
+› Yes, we expecting that every message has an id in request
+
+
+A:
+
+• I’ll record the expected producer contract in `MLDE-660-03` and leave the validation decision open.
+
+• I recorded the producer contract in [MLDE-660-03](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-03). Every message in a tribe request is expected to have an ID, so this issue only arises when a request violates that contract.
+
+I left the finding `pending`. The remaining decision is whether to accept the current behavior for malformed requests or have the adapter return `FAILED` when a message being scored has no ID.
+
+
+Q:
+
+› so, input messages schema can't validate the message?
+
+
+A:
+
+• The input schema **does validate the message**, but it doesn’t enforce the tribe-specific ID requirement. Both scoring modes use the same `ChatMessage` model. It requires `senderId` and `text`, while `id` is declared as `Optional[str] = None`. A missing, `null`, or empty ID therefore passes validation. [Shared message schema](/workspace/data/chat-scoring-adapter/app/service/data_models.py:27)
+
+The ID is checked later, when the adapter maps an LLM violation back to the original message. At that point, a missing or empty ID causes the flagged message to be dropped. [Violation mapping](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:134)
+
+
+Q:
+
+› show me the code, I can't find it
+
+
+A:
+
+• I’ll check the current checkout and pull out the two relevant code snippets.
+
+• **Input schema.** `ChatScoringRequest` uses `messages: list[ChatMessage]`. In `ChatMessage`, line 38 makes `id` optional. The relevant fields are below. [data_models.py:38](/workspace/data/chat-scoring-adapter/app/service/data_models.py:38)
+
+```python
+class ChatMessage(BaseModel):
+    # ...
+
+    # required keys
+    senderId: int
+    text: str
+
+    # optional keys
+    id: Optional[str] = None
+```
+
+**Violation mapping.** `_to_violation()` skips the flagged message when `message.id` is `None` or `""`. If no message IDs remain, it drops the entire violation by returning `None`. [scoring_tasks.py:134](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:134)
+
+```python
+message_ids: list[str] = []
+for ref in item.messages:
+    message = messages.get(_parse_number(ref))
+    if (
+        message is None
+        or message.context
+        or message.senderId != suspect_id
+        or not message.id
+        or message.id in message_ids
+    ):
+        continue
+    message_ids.append(message.id)
+if not message_ids:
+    return None
+```
+
+
+Q:
+
+› OK, got it. Responce processing silently ignore possible violations, right?
+
+
+A:
+
+• Yes, **from the Kafka caller’s perspective**. If the LLM flags a message with a missing or empty ID, the adapter drops that message from the violation. If no valid message IDs remain, it drops the whole violation and can still return `SUCCESS` with an empty list. The service logs the discarded violation at `INFO`, but the Kafka response carries no warning. [Filtering](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:134) · [Logging](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:108)
+
+
+Q:
+
+› Show me the line where discarded violation is logged
+
+
+A:
+
+• The log call starts at [scoring_tasks.py:111](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:111):
+
+```python
+if violation is None:
+    self.log.info(
+        "TribeScoringTask, request %s, dropped violation: %s",
+        request.requestId,
+        item,
+    )
+```
+
+
+Q:
+
+› Got it. Well, if we have no enough data to create a claim, there is no way we can propagate a violation. So, logging is enough probably. Maybe WARNING would be better though. Am I wrong?
+
+
+A:
+
+• I agree. Without a message ID, the adapter can’t produce an actionable violation. Logging the drop is a reasonable choice if the producer is expected to supply IDs and the team accepts that a malformed request may still return `SUCCESS`.
+
+I’d use **`WARNING` specifically for missing IDs**, because that indicates a producer contract violation. Keep the generic discard log at `INFO` for unusable LLM references. Changing that generic log to `WARNING` would also miss a flagged message dropped from a violation that still has other valid message IDs. The missing-ID check itself is the right place to log the warning. [Discard log](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:111) · [ID check](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:141)
+
+
+Q:
+
+› OK, add this logging solution as note and mark problem as pending.
+
+
+A:
+
+• I’ll add the targeted `WARNING` proposal to `MLDE-660-03` and keep its status `pending`.
+
+• Updated [MLDE-660-03](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-03) and kept it `pending`. The note proposes logging a `WARNING` at the missing-ID check, even when other message IDs remain valid, and keeping the generic discard log at `INFO`.
+
+
+Q:
+
+› Next?
+
+
+A:
+
+• ### MLDE-660-04 · P2 · An empty Kafka partition can fail the hourly Airflow DAG
+
+The MR adds two Airflow sensors that wait for the Kafka-to-S3 connector to ingest tribe scoring requests and responses. The shared sensor checks for a committed offset on **every partition**. If a new partition has never received a message, the connector may have no offset to commit. The sensor raises before it checks whether the partition is empty. [New task groups](/workspace/data/airflow/dags/dwh/events__hourly.py:115) · [Sensor check](/workspace/data/airflow/dags/extentions/kafka/operators.py:169)
+
+I reproduced this locally with a mocked partition whose low and high watermarks were both `0` and whose committed offset was `OFFSET_INVALID`. The sensor raised even though there was nothing to ingest. One empty partition can block the dbt task while other partitions have traffic.
+
+I’d fix this in the shared sensor. If a partition has no committed offset, check its watermarks. Equal watermarks mean the partition is empty and can be skipped. If it contains records, keep waiting for the connector to commit. [Review finding](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-04)
+
+
+Q:
+
+› interesting, can you show me a diff of a fix?
+
+
+A:
+
+• I’d move the missing-commit check after the watermark lookup in [KafkaTimestampSensor](/workspace/data/airflow/dags/extentions/kafka/operators.py:169). An empty partition can be skipped. A nonempty partition without a committed offset makes the sensor wait for the next poll.
+
+```diff
+diff --git a/airflow/dags/extentions/kafka/operators.py b/airflow/dags/extentions/kafka/operators.py
+--- a/airflow/dags/extentions/kafka/operators.py
++++ b/airflow/dags/extentions/kafka/operators.py
+@@ -169,20 +169,17 @@ class KafkaTimestampSensor(BaseSensorOperator):
+-            if (
+-                offsets_committed[partition_meta.partition].offset
+-                == confluent_kafka.OFFSET_INVALID
+-            ):
+-                raise Exception(
+-                    f"Invalid commited offsets for topic ${topic}, partition ${partition_meta.partition}"
+-                )
+             partition_offset_committed = offsets_committed[partition_meta.partition].offset
+
+             # Get the partitions low and high watermark offsets.
+-            (_, hi_watermark) = consumer.get_watermark_offsets(
++            low_watermark, hi_watermark = consumer.get_watermark_offsets(
+                 partition_meta, timeout=10, cached=False
+             )
+-            if hi_watermark == confluent_kafka.OFFSET_INVALID:
++            if confluent_kafka.OFFSET_INVALID in (low_watermark, hi_watermark):
+                 raise Exception(
+-                    f"Invalid hi watermak offsets for topic ${topic}, partition ${partition_meta.partition}"
++                    f"Invalid watermarks for topic {topic}, partition {partition_meta.partition}"
+                 )
+
++            if partition_offset_committed == confluent_kafka.OFFSET_INVALID:
++                if low_watermark == hi_watermark:
++                    continue
++                return False
++
+             self.log.info(
+```
+
+I’d cover two cases in the regression test. With no committed offset and watermarks `(0, 0)`, the sensor continues to check the remaining partitions. With no committed offset and watermarks `(0, 3)`, it returns `False` and polls again later.
+
+
+Q:
+
+› Got it. So, if kafka topic is slow, and having three partitions, only one partition have a message, we will get a failure in current implementation?
+
+
+A:
+
+• Yes, **if either empty partition has no committed offset for `connect-kafkaToS3`**. For example, if partition 0 has a message and the connector has already ingested it, the sensor continues to partitions 1 and 2. If partition 1 has never received a message and returns `OFFSET_INVALID` for its committed offset, the current sensor raises before checking that the partition is empty. [Sensor check](/workspace/data/airflow/dags/extentions/kafka/operators.py:169)
+
+If partition 0 still has unread data, the sensor may return `False` first and retry later. Once it reaches an empty partition with no committed offset, it hits the same failure.
+
+
+Q:
+
+› so, as soon as every partition have commited ofset - we are safe?
+
+
+A:
+
+• Yes, **for this specific failure**. Once every partition has a valid committed offset for `connect-kafkaToS3`, a quiet partition can stay quiet. It doesn’t need a new message every hour.
+
+The sensor still checks whether the connector has caught up. For a partition with no message at or after the interval end, it compares the committed offset with the high watermark. If the commit has reached that watermark, the partition passes. [Sensor logic](/workspace/data/airflow/dags/extentions/kafka/operators.py:196)
+
+
+Q:
+
+› OK, add this diff and our conversation to notes and mark problem as pending, OK?
+
+
+A:
+
+• I’ll add the proposed diff and the discussion about quiet partitions to `MLDE-660-04`, with status `pending`.
+
+• Added the discussion and proposed diff to the notes for [MLDE-660-04](/workspace/data/MLDE-660-tribe-chat-moderation.review.md:69). The finding remains `pending`. The embedded diff passed `git apply --check` and is recorded in the review document only.
+
+
+Q:
+
+› Next?
+
+
+A:
+
+• ### MLDE-660-05 · P2 · Request tasks can outlive worker shutdown
+
+I reproduced this with two concurrent requests. Request A was still scoring when request B failed to publish its Kafka response. `process_messages()` raised and cancelled the reader. Request A kept running and published its response after `process_messages()` had already raised. In the service, that work can overlap with the Kafka and OpenRouter clients being closed. [Shutdown path](/workspace/data/chat-scoring-adapter/app/service/main.py:95) · [Review finding](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-05)
+
+The reader starts each request with `asyncio.create_task()` and only awaits those tasks when Kafka iteration ends normally. Cancelling the reader while it’s waiting for the next Kafka record leaves those tasks running. [Request task creation](/workspace/data/chat-scoring-adapter/app/service/main.py:132)
+
+I’d keep the fix small. Have the reader cancel and await outstanding request tasks when it exits on failure or cancellation, and have `process_messages()` await reader shutdown before the clients close. Any request left uncommitted can be reread after restart. The regression test should reproduce the two-request case and verify that the sibling finishes cancellation before `process_messages()` raises.
+
+
+Q:
+
+› Interesting, show me the diff of fix, please
+
+
+A:
+
+• I’ll draft the smallest shutdown change and check it against the two-request failure case.
+
+• The fix gives shutdown two explicit waits. `process_messages()` waits for the reader and healthcheck to stop, and the reader waits for its outstanding request tasks to finish cancelling. When Kafka iteration ends normally, outstanding requests still finish processing. [Worker code](/workspace/data/chat-scoring-adapter/app/service/main.py:104)
+
+```diff
+--- a/chat-scoring-adapter/app/service/main.py
++++ b/chat-scoring-adapter/app/service/main.py
+@@ -119,4 +119,5 @@
+         reader.cancel()
+         healthcheck.cancel()
++        await asyncio.gather(reader, healthcheck, return_exceptions=True)
+
+
+@@ -130,16 +131,21 @@
+     tasks: set[asyncio.Task] = set()
+
+-    async for msg in app.request_consumer:
+-        await slots.acquire()
+-        app.dbg(f"input_reader, got kafka message {msg.partition}:{msg.offset}")
+-        offsets.start(TopicPartition(msg.topic, msg.partition), msg.offset)
+-        task = asyncio.create_task(
+-            process_request(app, msg, slots, offsets, commit_lock, failure)
+-        )
+-        tasks.add(task)
+-        task.add_done_callback(tasks.discard)
+-
+-    if tasks:
+-        await asyncio.gather(*tasks)
++    try:
++        async for msg in app.request_consumer:
++            await slots.acquire()
++            app.dbg(f"input_reader, got kafka message {msg.partition}:{msg.offset}")
++            offsets.start(TopicPartition(msg.topic, msg.partition), msg.offset)
++            task = asyncio.create_task(
++                process_request(app, msg, slots, offsets, commit_lock, failure)
++            )
++            tasks.add(task)
++            task.add_done_callback(tasks.discard)
++
++        if tasks:
++            await asyncio.gather(*tasks)
++    finally:
++        for task in tasks:
++            task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+```
+
+I tested the proposed code in memory. When one request failed to publish, the sibling completed cancellation before `process_messages()` raised, and no offset was committed. In the normal completion case, both responses were published and both offsets committed.
+
+
+Q:
+
+› and when will healthcheck stop?
+
+
+A:
+
+• The healthcheck stops when `process_messages()` starts shutting down. That happens when the Kafka reader finishes or fails, a request hits a fatal publish or commit error, or the service task is cancelled. The `finally` block cancels the reader and healthcheck together, then the proposed fix waits for both to finish before closing the clients. [Shutdown block](/workspace/data/chat-scoring-adapter/app/service/main.py:110)
+
+The healthcheck usually waits in `asyncio.sleep()`, so cancellation interrupts that sleep immediately. It doesn’t wait for the next healthcheck interval or for the reader to finish cleaning up. [Healthcheck loop](/workspace/data/chat-scoring-adapter/app/service/main.py:211)
+
+
+Q:
+
+› Super! OK, add that diff and discussion in notes, mark problem as pending, OK?
+
+
+A:
+
+• I’ll add the shutdown diff, the healthcheck timing, and the verification results to `MLDE-660-05`, keeping it `pending`.
+
+• Added the shutdown diff, healthcheck discussion, and verification results to [MLDE-660-05](/workspace/data/MLDE-660-tribe-chat-moderation.review.md:125). The finding remains `pending`. The embedded diff passed `git apply --check`.
+
+
+Q:
+
+› next?
+
+
+A:
+
+• ### MLDE-660-06 · P2 · The image smoke test can miss a startup failure
+
+CI starts each image, waits three seconds, and searches its logs for `Starting chat-scoring-adapter service`. The app prints that line **before** it validates `scoring_mode` and initializes the Kafka clients. I ran the entry point with an invalid scoring mode. It printed the expected line and then exited with code `1`, so the log check would still match. [CI smoke test](/workspace/data/chat-scoring-adapter/.ci/build_service_image.sh:60) · [Application startup](/workspace/data/chat-scoring-adapter/app/service/main.py:37)
+
+I’d add a **configuration-only check inside the built image**. Have it load the packaged YAML through the application’s startup code, verify that the mode matches the CI variant, and resolve the configured prompt and scoring task. That would catch a bad config or a mix-up between the two images without requiring live Kafka or OpenRouter in CI. [Review finding](/workspace/data/MLDE-660-tribe-chat-moderation.review.md#mlde-660-06)
+
+
+Q:
+
+› ok, show me the line where it validates scoring_mode
+
+
+A:
+
+• The check is in [`scoring_tasks.py:51`](/workspace/data/chat-scoring-adapter/app/service/scoring_tasks.py:51). `make_scoring_task()` accepts `chat` or `tribe` and raises `ValueError` for any other value.
+
+```python
+def make_scoring_task(mode: str, logger: Logger | None = None) -> ScoringTask:
+    if mode == SCORING_MODE_CHAT:
+        return ChatScoringTask()
+    if mode == SCORING_MODE_TRIBE:
+        return TribeScoringTask(logger)
+    raise ValueError(
+        f"'{mode}' is not a valid scoring mode. Choose from: {[SCORING_MODE_CHAT, SCORING_MODE_TRIBE]}"
+    )
+```
+
+Startup calls it at [`main.py:62`](/workspace/data/chat-scoring-adapter/app/service/main.py:62) via `task=make_scoring_task(cfg.scoring_mode, logger)`.
+
+
+Q:
+
+› Got it. We will add log entry after 'score_service' initializing, and test will be checking that entry. Mark problem as pending, please
+
+
+A:
+
+• I’ll record that plan in `MLDE-660-06` and leave it `pending`.
+
+• Updated [MLDE-660-06](/workspace/data/MLDE-660-tribe-chat-moderation.review.md:192) and kept it `pending`. The notes now specify adding a log entry after `score_service` initializes and having the image smoke test check for that entry.
+
+
+Q:
+
+› next?
+
+
+A:
+
+• ### MLDE-660-07 · P3 · Tribe tests send the private-chat prompt
+
+The tribe fixture sets `scoring_mode: tribe` but leaves out `prompt_name`. `AppConfig` then defaults to the private-chat prompt, `TEMPLATE_JUN26_26`. The test checks the transcript sent as the **user** message and never checks the **system** prompt, so it passes with the wrong prompt. The shipped tribe configs already select `TEMPLATE_TRIBE_NOV23_26`. [Test fixture](/workspace/data/chat-scoring-adapter/app/tests/conftest.py:26) · [Prompt default](/workspace/data/chat-scoring-adapter/app/service/app_services.py:73) · [HTTP assertion](/workspace/data/chat-scoring-adapter/app/tests/test_tribe.py:162) · [Tribe config](/workspace/data/chat-scoring-adapter/app/config/app-parameters-tribe-prod.yaml:25)
+
+I’d load the shipped tribe config in the fixture and assert that the outgoing system message contains the expected tribe prompt. That gives us a regression test for the prompt and scoring mode working together.
+
+
+Q:
+
+› Show me the possible fix diff
+
+
+A:
+
+• I’ll draft the fixture and assertion changes, then check that the new assertion fails with the old fixture and passes with the shipped tribe config.
+
+• The fixture loads the shipped tribe development config and keeps the short test timeout and single attempt. The test then checks the actual system prompt sent alongside the transcript.
+
+```diff
+--- a/chat-scoring-adapter/app/tests/conftest.py
++++ b/chat-scoring-adapter/app/tests/conftest.py
+@@ -1,6 +1,8 @@
+ import json
+ import logging
++from pathlib import Path
+
+ import pytest
++import yaml
+ from unittest.mock import AsyncMock
+
+@@ -26,11 +28,7 @@
+ @pytest.fixture(scope="function")
+ async def tribe_app_services():
+-    yield _app_services(
+-        {
+-            "KafkaRequestTopic": "tribe-chat-scoring-request",
+-            "KafkaResponseTopic": "tribe-chat-scoring-response",
+-            "scoring_mode": "tribe",
+-        }
+-    )
++    config_path = Path(__file__).parents[1] / "config" / "app-parameters-tribe-dev.yaml"
++    parameters = yaml.safe_load(config_path.read_text())
++    yield _app_services(parameters | {"MaxProcessingTimeSec": 1, "MaxRetryAttempts": 1})
+
+
+--- a/chat-scoring-adapter/app/tests/test_tribe.py
++++ b/chat-scoring-adapter/app/tests/test_tribe.py
+@@ -12,4 +12,5 @@
+ from service.main import process_messages
+ from service.app_services import AppServices
++from service.llm_prompts import PromptEnum
+
+ from conftest import JSONMatcher
+@@ -162,4 +163,8 @@
+     assert route.called
+     llm_input = json.loads(route.calls.last.request.content)["input"]
++    assert llm_input[0] == {
++        "role": "system",
++        "content": PromptEnum.TEMPLATE_TRIBE_NOV23_26.value,
++    }
+     assert llm_input[1]["content"] == "\n".join(
+         [
+```
+
+I verified in a temporary copy that the new assertion fails with the existing fixture. With the proposed fixture, all 30 adapter tests and the Black check for both changed files passed.
+
+
+Q:
+
+› hm, it doesn't really test anything worth testing. Only that yaml file have some fixed in test values. No, we don't need that.
+
+
+A:
+
+• I’ll close `MLDE-660-07` in the review with the rationale that pinning the prompt name in the test adds little coverage.
+
+• Marked [MLDE-660-07](/workspace/data/MLDE-660-tribe-chat-moderation.review.md# mlde-660-07) as `closed`. The notes record that pinning a specific prompt version would add little coverage for this MR.
+
+
+Q:
+
+› Great! Next?
+
+
+A:
+
+• ### MLDE-660-08 · P3 · Build and deploy calculate the same ECR image reference separately
+
+The build script calculates the image reference it pushes, and the deploy script recalculates the reference it puts in the ECS task definition. Today both use the same repository, variant prefix, version, and `-dev` suffix. The risk is future drift. For example, changing the suffix in the build script alone could leave ECS pointing to a tag that CI never pushed. [Build script](/workspace/data/chat-scoring-adapter/.ci/build_service_image.sh:17) · [Deploy script](/workspace/data/chat-scoring-adapter/.ci/update_ecs_service.sh:21)
+
+I’d move the shared calculation into `service_variant.sh`, which both scripts already source. They can then use the same `ECR_DOCKER_IMAGE` value while keeping config selection and ECS cluster selection in their respective scripts. This is a small DRY cleanup with no known deployment failure today. [Shared script](/workspace/data/chat-scoring-adapter/.ci/service_variant.sh)
+
+
+Q:
+
+› show me the diff, please
+
+
+A:
+
+• I’ll draft the shared image-reference change and verify that all four variant and environment combinations keep their existing tags.
+
+• Both scripts already source `service_variant.sh`. The proposed diff moves the ECR image reference there and keeps config file selection in the build script and ECS cluster selection in the deploy script.
+
+```diff
+--- a/chat-scoring-adapter/.ci/service_variant.sh
++++ b/chat-scoring-adapter/.ci/service_variant.sh
+@@ -22,2 +22,12 @@
+
+ echo "Using SERVICE_VARIANT='${SERVICE_VARIANT}', service '${CHAT_SCORING_SERVICE_NAME}'"
++
++CHAT_SCORING_SERVICE_VERSION=$(yq '.components.image_service_version' versions.yaml)
++if [[ "${ENV_NAME}" == "develop" ]]; then
++    CHAT_SCORING_SERVICE_VERSION+=-dev
++fi
++
++export ECR_REPO_SHORTNAME=chat-scoring-adapter
++export ECR_REPO_NAME=405263509977.dkr.ecr.us-east-1.amazonaws.com/${ECR_REPO_SHORTNAME}
++export ECR_IMAGE_TAG=${SERVICE_ARTIFACT_PREFIX}-${CHAT_SCORING_SERVICE_VERSION:?is unset or null}
++export ECR_DOCKER_IMAGE=${ECR_REPO_NAME}:${ECR_IMAGE_TAG}
+--- a/chat-scoring-adapter/.ci/build_service_image.sh
++++ b/chat-scoring-adapter/.ci/build_service_image.sh
+@@ -16,8 +16,6 @@
+
+ if [[ "${ENV_NAME}" == "develop" ]]; then
+-    export CHAT_SCORING_SERVICE_VERSION="$(yq '.components.image_service_version' versions.yaml)-dev"
+     cp -v app/config/${APP_PARAMETERS_PREFIX}-dev.yaml app/config/app-parameters.yaml
+ elif [[ "${ENV_NAME}" == "prod" ]]; then
+-    export CHAT_SCORING_SERVICE_VERSION=$(yq '.components.image_service_version' versions.yaml)
+     cp -v app/config/${APP_PARAMETERS_PREFIX}-prod.yaml app/config/app-parameters.yaml
+ else
+@@ -30,9 +28,4 @@
+
+ # if prod: check that image does not exist in ECR
+-
+-export ECR_REPO_SHORTNAME=chat-scoring-adapter
+-export ECR_REPO_NAME=405263509977.dkr.ecr.us-east-1.amazonaws.com/${ECR_REPO_SHORTNAME}
+-export ECR_IMAGE_TAG=${SERVICE_ARTIFACT_PREFIX}-${CHAT_SCORING_SERVICE_VERSION:?is unset or null}
+-export ECR_DOCKER_IMAGE=${ECR_REPO_NAME}:${ECR_IMAGE_TAG}
+
+ export IMAGE_META="$(aws ecr describe-images --repository-name=${ECR_REPO_SHORTNAME} --image-ids=imageTag=${ECR_IMAGE_TAG})"
+--- a/chat-scoring-adapter/.ci/update_ecs_service.sh
++++ b/chat-scoring-adapter/.ci/update_ecs_service.sh
+@@ -21,8 +21,6 @@
+ if [[ "${ENV_NAME}" == "develop" ]]; then
+     export ECS_CLUSTER=gameram-fargate-develop
+-    export CHAT_SCORING_SERVICE_VERSION="$(yq '.components.image_service_version' versions.yaml)-dev"
+ elif [[ "${ENV_NAME}" == "prod" ]]; then
+     export ECS_CLUSTER=gapp-prod
+-    export CHAT_SCORING_SERVICE_VERSION=$(yq '.components.image_service_version' versions.yaml)
+ else
+     echo "Unknown ENV_NAME=${ENV_NAME}"
+@@ -30,9 +28,4 @@
+ fi
+ echo "Using ECS_CLUSTER='${ECS_CLUSTER}' for ENV_NAME='${ENV_NAME}'"
+-
+-export ECR_REPO_SHORTNAME=chat-scoring-adapter
+-export ECR_REPO_NAME=405263509977.dkr.ecr.us-east-1.amazonaws.com/${ECR_REPO_SHORTNAME}
+-export ECR_IMAGE_TAG=${SERVICE_ARTIFACT_PREFIX}-${CHAT_SCORING_SERVICE_VERSION:?is unset or null}
+-export ECR_DOCKER_IMAGE=${ECR_REPO_NAME}:${ECR_IMAGE_TAG}
+
+ # Create log group, ignore error if already exists
+```
+
+Bash syntax passed for all three proposed scripts. With `yq` stubbed, all four `chat`/`tribe` and `develop`/`prod` combinations produced their existing image references.
+
+
+Q:
+
+› Excellent, mark it pending
+
+
+A:
+
+• `MLDE-660-08` is already `pending`. I’ll record the proposed shared calculation in its notes.
+
+• [MLDE-660-08](/workspace/data/MLDE-660-tribe-chat-moderation.review.md:214) is `pending`. I recorded the proposed move into `service_variant.sh` and the verification results for all four variant and environment combinations.
+
+We’ve now discussed all eight findings.
+
+
+Q:
+
+› Wonderful, thanks! Should we update our code-review skills?
+
+
+A:
+
+• Yes. I’d add three practices to the **Code reviews and validation** section of [AGENTS.md](/workspace/data/AGENTS.md):
+
+- **Review the cutover when state or ownership changes.** Trace what happens to queued work, committed offsets, and in-flight requests while old and new deployments overlap.
+- **Check what a passing test actually proves.** For smoke tests and concurrency tests, reproduce a failure case and verify that the test catches it. Prioritize behavior that can fail in production over assertions that pin a specific config value.
+- **Track decisions in the review report.** Give findings stable IDs and commit-pinned code links. Keep accepted risks visible, record why each finding was accepted or closed, and leave agreed fixes `pending` until verified.
+
+The first two would improve what we catch. The third would make the one-by-one review process repeatable.
+
+
+Q:
+
+› Agree, do it please
+
+
+A:
+
+• I’ll add those three practices to the existing code-review guidance in `AGENTS.md`.
+
+• Updated the [code-review guidance in AGENTS.md](/workspace/data/AGENTS.md:61). It now calls for reviewing deployment handoffs when state or work ownership changes, checking that smoke and concurrency tests catch relevant failures, and tracking findings with stable IDs, commit-pinned links, and documented decisions.
+
+`git diff --check` passed.
+
+
+Q:
+
+› Export today’s session, please
+
+
+A:
+
+• I’ll use the `export-session-dialog` skill to export today’s conversation as a Markdown transcript.

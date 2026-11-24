@@ -487,3 +487,56 @@ docker compose exec codex codex --version # codex-cli 0.170.0
 docker compose exec codex codex login status # Logged in using ChatGPT
 
 ```
+
+# 2026-11-24 codex update (0.170.0 -> 0.172.0)
+
+Очередное обновление, не-деструктивное (временное)
+```sh
+docker compose exec --user root codex bash -o pipefail -c '
+  curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
+  && TAR_OPTIONS=--no-same-owner \
+     CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin \
+     CODEX_NON_INTERACTIVE=true sh /tmp/install-codex.sh \
+  && chmod -R a+rX /opt/codex \
+  && rm /tmp/install-codex.sh
+'
+
+```
+
+```log
+==> Updating Codex CLI from 0.170.0 to 0.172.0
+==> Detected platform: Linux (x64)
+==> Resolved version: 0.172.0
+==> Downloading Codex CLI
+==> Installing standalone package to /opt/codex/packages/standalone/releases/0.172.0-x86_64-unknown-linux-musl
+WARNING: Could not safely inspect old Codex releases; skipped remaining cleanup.
+==> /usr/local/bin is already on PATH
+==> Current terminal: codex
+==> Future terminals: open a new terminal and run: codex
+Codex CLI 0.172.0 installed successfully.
+
+```
+
+```sh
+docker compose exec --user root codex bash -c '
+  ls -lah /opt/codex/packages/standalone/releases/
+'
+
+```
+
+```log
+drwxr-xr-x 5 root root 4.0K Nov 18 08:59 0.170.0-x86_64-unknown-linux-musl
+drwxr-xr-x 5 root root 4.0K Nov 24 11:25 0.172.0-x86_64-unknown-linux-musl
+
+```
+
+```sh
+docker compose exec --user root codex bash -c '
+  rm -rfv /opt/codex/packages/standalone/releases/0.170.0-x86_64-unknown-linux-musl \
+  && rm -fv /tmp/install-codex.sh
+'
+
+docker compose exec codex codex --version # codex-cli 0.172.0
+docker compose exec codex codex login status # Logged in using ChatGPT
+
+```
