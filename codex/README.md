@@ -38,3 +38,4 @@
 
 - [working sessions 3](./codex-sessions-03.md)
 - [working sessions 4](./codex-sessions-04.md)
+- [working sessions 5](./codex-sessions-05.md)
