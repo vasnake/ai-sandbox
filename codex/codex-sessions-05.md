@@ -115,7 +115,9 @@ A:
 
 Q:
 
-› OK, lets see what we have in actual redis db. We have redis: '''rediscli -h 10.0.2.61 -p 26379
+› OK, lets see what we have in actual redis db. We have redis:
+```
+rediscli -h 10.0.2.61 -p 26379
 10.0.2.61:26379> SENTINEL get-master-addr-by-name mymaster
 1) "10.0.2.95"
 2) "6379"
@@ -124,7 +126,7 @@ Q:
 10.0.2.95:6379> info server
 # Server
 redis_version:8.8.0
-'''
+```
 
 
 A:
@@ -2016,3 +2018,715 @@ Q:
 A:
 
 • I’ll use the `export-session-dialog` skill to export today’s conversation as a Markdown transcript.
+
+## 2026-11-26 gyml features
+
+Q:
+
+› Hi, today we will be working on a task described in '.local/MLDE-663-allLangs-feature.md'. All our important decisions and vital information should be saved in this doc. Each information block should have stable id for future references. Terminology, object names and code references should be written explicitly, for ease of search and use. If this is OK, lets discuss the plan of works.
+
+
+A:
+
+• I’ll read the task document and check the relevant repository code so we can agree on the work sequence and how to record decisions.
+
+• I’ve recorded the proposed plan and initial findings in the [MLDE-663 task notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:15). Each block has a stable ID and uses exact field, class, and function names.
+
+1. **MLDE-663-P01 · Trace both pipelines.** Follow language data from its source through Spark preparation and model encoding to training and inference. For GYML-online, also trace who builds the HTTP request.
+2. **MLDE-663-P02 · Agree on the feature contract.** Confirm the primary-language source, `allLangs` semantics, missing values, and encoding. Decide whether to preserve the legacy fields and add `primaryLang` and `allLangs` once we know which datasets, checkpoints, and callers depend on them.
+3. **MLDE-663-P03 · Implement GYML GNN.** Update data preparation, training, and batch inference together.
+4. **MLDE-663-P04 · Implement GYML-online.** Update Spark preparation, training, and the serving path once the request producer’s contract is clear.
+5. **MLDE-663-P05 · Validate and document rollout.** Check training and inference parity, compatibility with existing artifacts and callers, and deployment order.
+
+The first trace already found a naming trap. GYML GNN preparation has a locale-derived `lang` and a separate `language` selected with Spark `any_value`. GYML-online preparation also uses `any_value`, while its service maps request `language` to the model input `locale`. I’d resolve those paths in **P01** before deciding what to call the new fields. [GYML GNN preparation](/workspace/data/ml/data/pyspark_job/nodes.py:42) · [GYML-online preparation](/workspace/data/ml/data/pyspark_job/gyml_online.py:175) · [Service request schema](/workspace/data/gyml_online/app/service/main.py:102)
+
+
+Q:
+
+› Good! I have a few suggestions. For 'MLDE-663-F01' I'd say starting point is 'com.gameram.batch.gyml.gnn.index.user.LoadUserIndexJob'. For 'MLDE-663-F02' starting point would be 'dag_id="gyml_gnn_train"' and 'DAG_ID = "gyml_gnn_user_index_update_v2"', also we have 'valid' and 'test' airflow dags, but this could be postponed. For 'MLDE-663-F03' starting point would be 'dag_id="gyml_online_train"'.
+
+
+A:
+
+• I’ll update F01–F03 with those entry points and record the validation and test DAGs as deferred.
+
+• Updated the task notes with the confirmed starting points:
+
+- **F01** — `com.gameram.batch.gyml.gnn.index.user.LoadUserIndexJob` for the MLDE-39 reference. [Task notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:28)
+- **F02** — `gyml_gnn_train` and `gyml_gnn_user_index_update_v2` for GYML GNN training and regular batch inference. [Task notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:40)
+- **F03** — `gyml_online_train` for GYML-online data preparation, training, and deployment. [Task notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:53)
+
+Recorded the deferral of `gyml_gnn_valid_dataset` and `gyml_gnn_test_pipeline_v2` as **D02**. [Task notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:73)
+
+
+Q:
+
+› OK, cool! I propose before anything else we analyse our reference solution and record in doc exact data lineage for primary language and all languages. How is that?
+
+
+A:
+
+• I’ll trace both language fields through the MLDE-39 reference job, from the source datasets to the Redis hash, and record the lineage under F01.
+
+• Agreed. I traced the MLDE-39 reference from the dbt models through `LoadUserIndexJob` to the Redis hash and recorded it under **F01**.
+
+- **F01A — Primary language (`lang`).** `LoadUserIndexJob` reads `analytics.user_profile_snapshot.language_code` as of the run’s reference hour. Upstream, dbt prefers the account language flagged `is_main_language`, chooses one without a defined order when none is flagged, and falls back to the linked device’s language when the account code is null. [Primary-language lineage](/workspace/data/.local/MLDE-663-allLangs-feature.md:34)
+- **F01B — All account languages (`allLangs`).** Spark reads the highest available hour of the `account_languages` S3 dump on the reference date, even if that hour is later than the reference hour. It collects distinct non-null codes per account and sorts them. [All-languages lineage](/workspace/data/.local/MLDE-663-allLangs-feature.md:63)
+- **F01C — Join and Redis output.** The inner joins require both a qualifying profile and at least one qualifying account language. Redis stores `lang` as a scalar and `allLangs` as a comma-separated `TAG` field. The resolved `lang` can be absent from `allLangs`, for example when it comes from the device fallback. [Join and output](/workspace/data/.local/MLDE-663-allLangs-feature.md:99)
+
+
+Q:
+
+› Great! Now we should understand (analyse) the current pipeline (data lineage) for gyml and gyml-online, in order to find what language features collected and how it is done. Agree?
+
+
+A:
+
+• I’ll trace the language fields from the Airflow entry points through Spark preparation and into both models, then record the verified paths under F02 and F03.
+
+• I traced both pipelines and recorded the source reads, transformations, and model inputs under **F02** and **F03**.
+
+| Pipeline | Language collected | Language the model uses |
+|---|---|---|
+| **GYML GNN training and regular inference** | `lang` comes from `analytics.user_profile_snapshot.language_code`. A separate `language` is selected from `account_languages.code` using Spark `any_value`. Both are indexed. | The checked-in graph config selects only `indexed_language`, the arbitrary account language. [F02](/workspace/data/.local/MLDE-663-allLangs-feature.md:138) |
+| **GYML-online training** | Spark selects one `account_languages.code` with `any_value` at the exact `run_dth` hour and writes it as `locale`. | `ColdModel` uses that scalar after `transform_locale` encodes it. [F03A](/workspace/data/.local/MLDE-663-allLangs-feature.md:194) |
+| **GYML-online HTTP inference** | The backend fills `features.language` from `SearchFilters.lang`, which comes from the requester’s identity locale. | The service maps `language` to `locale` and uses the same encoder as training. [F03B](/workspace/data/.local/MLDE-663-allLangs-feature.md:226) |
+
+The key distinction for MLDE-663 is that **GYML GNN already collects the profile language but selects a different model input**, and **GYML-online uses different language sources in training and serving**. The Redis `allLangs` field from MLDE-39 is added after GNN inference and does not feed either model.
+
+This trace covers the checked-in code and version pins. Live ZIPs and deployed model configs were outside the verification. [F03C](/workspace/data/.local/MLDE-663-allLangs-feature.md:252)
+
+
+Q:
+
+› OK, good. I've decided that we should add two new fields to the dataset, used by training process (for both models): 'primary_lang' or 'primaryLang' and 'all_langs' or 'allLangs', depending on existing conventions. Do we have enough information to design updated pipelines?
+
+
+A:
+
+• I’ll record the additive fields as a decision and check which parts of the pipeline design are ready to specify.
+
+• Yes. We have enough information to design the **data preparation** for both models. I recorded the additive schema decision and chose `primary_lang` and `all_langs` to match the existing PySpark column names. [D01](/workspace/data/.local/MLDE-663-allLangs-feature.md:264)
+
+I’d use the same data contract in both pipelines:
+
+- **`primary_lang`** is a string from `analytics.user_profile_snapshot.language_code` at the reference hour.
+- **`all_langs`** is a sorted, distinct array of language codes from the `account_languages` dump at that same hour.
+- **Both fields** are left-joined by `account_id` so missing language data doesn’t drop training examples. I’d use null for a missing primary language and an empty array for a missing list. [Proposed contract, D03](/workspace/data/.local/MLDE-663-allLangs-feature.md:280)
+
+For **GYML GNN**, add the columns in the shared user-node job so training and regular batch inference get the same data. For **GYML-online**, add them to the requester features in `GymlOnlinePrepareDatasetJob`, which will need a ClickHouse profile read.
+
+The open design decisions are **how the models encode the list**, **how existing checkpoints remain usable**, and **how the backend supplies both values to GYML-online at serving time**. The current request carries one language derived from the requester’s identity locale. [Model and serving contracts, D04](/workspace/data/.local/MLDE-663-allLangs-feature.md:303)
+
+
+Q:
+
+› Wait a sec, are we discussing design already?
+
+
+A:
+
+• I jumped ahead. You asked whether we had enough information to start designing, and I included an initial proposal.
+
+The decision so far is to add two language fields to both training datasets while preserving the existing fields. The source, join, and missing-value rules in **D03** are proposals. No pipeline code has changed.
+
+
+Q:
+
+› OK, got it. As we have enough information, lets start design for data prep. Lets do it incrementally, for gyml first. As I understand, the same data prep spark job is used for train and inference pipelines, correct?
+
+
+A:
+
+• I’ll verify how the training and regular inference DAGs invoke user-feature preparation.
+
+• Yes. `gyml_gnn_train` and `gyml_gnn_user_index_update_v2` both submit `pyspark_runner.py nodes user`, which dispatches to `GNNUserFeaturesJob`. That gives us one place to add `primary_lang` and `all_langs` for both paths. [Training call](/workspace/data/airflow/dags/batch/gyml/train_tasks/data_collect.py:167) · [Inference call](/workspace/data/airflow/dags/batch/gyml/common.py:89) · [Job dispatch](/workspace/data/ml/data/pyspark_job/nodes.py:633)
+
+Training passes mode `train` and uses `params.run_dth` as the reference hour. Regular inference passes mode `inference` and uses `data_interval_start`. The DAGs pin their ML ZIP versions separately, so each path picks up the change when it runs a ZIP containing the updated job. I recorded this in [F02A](/workspace/data/.local/MLDE-663-allLangs-feature.md:138).
+
+
+Q:
+
+› Great! And this job use user-profile snapshot already?
+
+
+A:
+
+• Yes. `GNNUserFeaturesJob` reads ClickHouse `analytics.user_profile_snapshot` at the end of the feature date range. The source is called `locale` in `load_user_sources`, and the SQL aliases the snapshot’s `language_code` to `locale`. [Source read](/workspace/data/ml/data/pyspark_job/nodes.py:517) · [Snapshot query](/workspace/data/ml/common/__init__.py:44)
+
+That query currently requires a positive `account_id`, a non-null `language_code`, and a non-null `country_code`. Then `prepare_account_lang` takes the part before the first hyphen to produce the existing `lang` column. So we already have the snapshot read and ClickHouse connection in both GNN paths. The design question is whether `primary_lang` should inherit the existing country filter and language-code splitting. [Language transformation](/workspace/data/ml/data/pyspark_job/nodes.py:42)
+
+
+Q:
+
+› Interesting. Lets look at data sample: user profile data sample
+```sql
+select *
+from analytics.user_profile_snapshot(date=toDate('2026-11-09'), hour=6)
+where account_id in (7, 10, 45, 9992425) limit 100;
+
+execution_date|execution_hour|account_id|udid                                |install_ts                   |device_update_ts             |registration_ts              |enabled|bio                                                                        |avatar_type|nickname    |birth_date|age|age_category|show_age|gender|show_gender|language_code|country_code|region_name  |timezone|last_tenjin_analytics_id            |app_theme|device_theme|has_link|email_domain|is_email_domain_blocked|is_test|push_allowed|platform|subscribers_count|subscriptions_count|
+--------------+--------------+----------+------------------------------------+-----------------------------+-----------------------------+-----------------------------+-------+---------------------------------------------------------------------------+-----------+------------+----------+---+------------+--------+------+-----------+-------------+------------+-------------+--------+------------------------------------+---------+------------+--------+------------+-----------------------+-------+------------+--------+-----------------+-------------------+
+    2026-11-09|             6|         7|36e57000e28423cc                    |2025-06-23 13:02:28.637269000|2026-10-10 19:35:18.830619000|2020-12-02 11:31:42.414612000|true   |Love RPG, adventures and some indie                                        |UNKNOWN    |Steel_Selena|1988-02-23| 38|35-44       |true    |FEMALE|true       |en           |TR          |EurTurkIsrl  |     444|8e884922-aa79-4e32-b23f-2ae2d875dfd9|DARK     |DARK        |true    |gmail.com   |false                  |true   |false       |Android |             6510|                557|
+    2026-11-09|             6|        10|UNKNOWN                             |                             |                             |2020-12-02 12:44:32.436313000|true   |                                                                           |CUSTOM     |VladShturma |          |   |            |false   |      |false      |             |            |             |        |                                    |         |            |false   |            |false                  |false  |            |        |                1|                  0|
+    2026-11-09|             6|        45|9A36AA95-0019-41A9-9B74-D97030794D0A|                             |2026-09-28 20:09:53.290435000|2020-12-08 14:39:21.209814000|true   |🌚 Eternal Supp¶🐈 Khajjit Fan¶🐃 Spirit Breaker Cancer¶👑 Korean RNG Queen|UNKNOWN    |Olenka      |1993-12-06| 32|25-34       |true    |FEMALE|false      |ru           |TH          |SouthEastAsia|      16|                                    |SYSTEM   |DARK        |true    |gameram.com |false                  |true   |false       |iOS     |              522|                 24|
+    2026-11-09|             6|   9992425|2245e7772d40dd00                    |2024-12-06 20:37:59.547965000|2026-10-25 06:39:37.470001000|2025-01-25 16:54:00.419979000|true   |self centered loner                                                        |UNKNOWN    |vlk.vlk     |1977-07-07| 49|45-54       |false   |MALE  |false      |en           |US          |NorthAmerica |     494|                                    |DARK     |DARK        |true    |gameram.com |false                  |true   |false       |Android |              290|                197|
+```
+
+
+A:
+
+• I’ll record what the sample shows about language and geography in the task notes.
+
+• The sample makes the distinction concrete. Account `7` has language `en` and country `TR`, while account `45` has language `ru` and country `TH`. Account `10` is registered and has blanks in all three fields. The display doesn’t tell us whether those blanks are SQL `NULL` or empty strings, and none of the four rows shows a known language with missing geography. [Sample notes, F02C](/workspace/data/.local/MLDE-663-allLangs-feature.md:194)
+
+For GYML GNN, I’d **reuse one profile snapshot read** and derive both outputs from it. The existing `lang` and country projection would keep its current filters and transformation. The new `primary_lang` would take `language_code` directly, without requiring a country code or splitting on `-`. That keeps the legacy behavior and lets the new language field depend on language data alone.
+
+
+Q:
+
+› I don't understand how we could use split by '-' and use parts of this split, if there no '-' in data?
+
+
+A:
+
+• The code uses only the first element of the split. If there’s no hyphen, the split returns a one-element array, so the value passes through unchanged. `en` becomes `["en"]` and yields `en`. A value like `en-US` would become `["en", "US"]` and also yield `en`. [Existing expression](/workspace/data/ml/data/pyspark_job/nodes.py:50)
+
+So the split has no effect on the populated values in your sample. For `primary_lang`, I’d copy `language_code` directly. That preserves exactly what the profile snapshot provides.
+
+
+Q:
+
+› OK, we definetely should prefer simple over complex, so language_code from profile is what we need for primary lang. What about country?
+
+
+A:
+
+• I’ll trace where `country_code` goes today and record the decision to use `language_code` directly for `primary_lang`.
+
+• For this change, I’d keep country and region on their existing paths and let `primary_lang` depend only on `language_code`.
+
+GYML GNN has two geography paths today:
+
+- The profile snapshot’s `country_code` feeds the legacy `region` feature. The existing `locale` query requires both a country and a language, so we’d need to preserve that filter for the legacy projection while letting `primary_lang` use the same snapshot independently.
+- The `account` dump’s `region` column feeds `countryCode`, which maps to `region_new`. The checked-in model uses `indexed_region_new`. [Geography lineage, F04](/workspace/data/.local/MLDE-663-allLangs-feature.md:336)
+
+I recorded the decision to copy `language_code` directly for GYML GNN. My proposal is that a missing country should still allow a known `primary_lang`. [Primary-language decision, D05](/workspace/data/.local/MLDE-663-allLangs-feature.md:329)
+
+
+Q:
+
+› I'm confused. Lets reiterate. Current pipeline uses profile and extract from it language code and region?
+
+
+A:
+
+• Yes. The current GYML GNN Spark job reads two fields from `analytics.user_profile_snapshot`: `language_code` and `country_code`. The SQL aliases them to `locale` and `region`, respectively. It doesn’t read the snapshot’s `region_name` field. [Snapshot query](/workspace/data/ml/common/__init__.py:44)
+
+Spark then derives `lang` from `locale` and maps the country code to the legacy `region` feature. The confusing part is that **`region` in the SQL result is still a country code**, such as `TR`. [Spark projection](/workspace/data/ml/data/pyspark_job/nodes.py:42) · [Country-to-region mapping](/workspace/data/ml/data/pyspark_job/nodes.py:157)
+
+
+Q:
+
+› But in profile we have 'region_name' and I don't see why we need to use 'legacy region feature', whatewer that is?
+
+
+A:
+
+• I’ll check which region feature the current graph consumes and whether older configs still reference the legacy one.
+
+• We don’t need the legacy `region` feature to add `primary_lang`. The checked-in GYML GNN model uses `indexed_region_new`, which comes from the `account` dump and a country-to-region mapping. I found `indexed_region` in the archived `pre-MLDE-533` graph. That explains why there are two names. [Geography lineage, F04](/workspace/data/.local/MLDE-663-allLangs-feature.md:336)
+
+The profile’s `region_name` is already the warehouse’s mapped region. We could use it in a future geography change, but replacing `region_new` with it would change an active model input’s source. For MLDE-663, I’d read `language_code` directly for `primary_lang` and give that field no country or region requirement.
+
+
+Q:
+
+› Jesus, what a mess. Later we have to have a thorow audit of data flow, at least.
+
+
+A:
+
+• I’ll record a separate follow-up for the GYML data-flow audit.
+
+• Recorded the thorough GYML data-flow audit as a separate follow-up. The language and geography traces we’ve already gathered give it a starting point. [A01](/workspace/data/.local/MLDE-663-allLangs-feature.md:361)
+
+
+Q:
+
+› OK, we will use the current profile source, and get primary lang from it. Only records with not null account_id, language_code, country_code, region_name should be used.
+
+
+A:
+
+• I’ll record the four required non-null fields for the GYML GNN primary-language projection.
+
+• Recorded in [D05](/workspace/data/.local/MLDE-663-allLangs-feature.md:327). For GYML GNN, we’ll use the existing profile snapshot and copy `language_code` directly into `primary_lang`.
+
+A profile row qualifies when `account_id > 0` and `language_code`, `country_code`, and `region_name` are all non-null. The `region_name` check is the only new eligibility check for this projection.
+
+
+Q:
+
+› We don't add another join with profile, you understand? We reuse existing join.
+
+
+A:
+
+• I’ll record that `primary_lang` travels through the existing profile join.
+
+• Yes. We’ll carry `primary_lang` in the existing `account_lang` DataFrame and reuse its left join on `account_id`. The `region_name` check controls whether `primary_lang` is populated. The same join continues to supply the legacy `lang` and `country` columns under their current rules. [D05](/workspace/data/.local/MLDE-663-allLangs-feature.md:328)
+
+
+Q:
+
+› Again, why is this: 'The region_name check controls whether primary_lang is populated.' Why there is a link between region and lang?
+
+
+A:
+
+• Language and region are independent profile attributes. I interpreted your four-field non-null rule as applying only to `primary_lang` so the existing `lang` and `country` outputs would keep their current behavior. That was my assumption.
+
+If you meant the rule to define **which profile rows qualify for the existing join**, we’d apply it once to the profile rows. Every qualifying row would then supply `primary_lang` directly from `language_code`. The trade-off is that a row with a null `region_name` would also stop supplying the existing `lang` and `country` values.
+
+
+Q:
+
+› No, they not independent. They are attributes of user profile. One user have one profile, as in sample data I showed you.
+
+
+A:
+
+• I’ll update D05 to make the four checks a single profile-row eligibility rule.
+
+• Understood. The four non-null checks apply to the **whole profile row**. A qualifying profile supplies `primary_lang` directly from `language_code` through the existing left join. If the profile fails any check, the account stays in the dataset and its profile-derived fields are null. I corrected [D05](/workspace/data/.local/MLDE-663-allLangs-feature.md:328).
+
+
+Q:
+
+› That brings another question: why left join? Can you find any specific reason why we could need record for account with unknown vital profile attributes?
+
+
+A:
+
+• I’ll trace accounts without a qualifying profile through the graph and inference jobs, and check whether the code gives a reason for keeping them.
+
+• I found a concrete reason to keep these accounts **as graph nodes**, but no documented business requirement for the original left join. An enabled account without a qualifying profile can still have language from `account_languages`, region from the account dump, and interaction features. Those inputs are enough for the current graph pipeline to use the node. [Account feature preparation](/workspace/data/ml/data/pyspark_job/nodes.py:122) · [Current model inputs](/workspace/data/ml/configs/graph/graph.yaml:205)
+
+An inner join at this stage would remove the account **and its edges**, including edges that provide context for users with complete profiles. The final Redis index already applies its own inner join to the profile snapshot after inference, so graph participation and index eligibility are separate decisions. [Graph edge filtering](/workspace/data/ml/data/pyspark_job/filters.py:174) · [Redis index join](/workspace/data/etl/src/main/scala/com/gameram/batch/gyml/gnn/index/user/UserIndexDatasetBuilder.scala:399)
+
+If the policy is that only complete profiles should appear in the **index**, I’d keep the left join for graph preparation. If complete profiles are required for **every graph node**, an inner join expresses that policy, but we should measure how many nodes and edges it removes. I recorded the findings in [F05](/workspace/data/.local/MLDE-663-allLangs-feature.md:369).
+
+
+Q:
+
+› Got it, thanks! OK, I agree that, in the end, for our current task we should change as little as possible, ideally only add two new features. So no changes in join, no new filters. Agree?
+
+
+A:
+
+• I’ll update the design notes to keep the existing joins and filters and make the change additive.
+
+• Agreed. For GYML GNN, this is an additive change. `primary_lang` comes directly from `language_code` through the existing profile join, and `all_langs` can go through the existing account-language join. Both joins and all current filters stay as they are.
+
+I updated the notes to withdraw the earlier `region_name IS NOT NULL` proposal. [Dataset design, D03](/workspace/data/.local/MLDE-663-allLangs-feature.md:296) · [Profile decision, D05](/workspace/data/.local/MLDE-663-allLangs-feature.md:327)
+
+
+Q:
+
+› OK, super! Now, what about all_langs? Current pipeline use required sources already?
+
+
+A:
+
+• Yes. `GNNUserFeaturesJob` already reads the `account_languages` S3 dump at the reference hour in both training and regular inference. The dump already contains `account_id` and the resolved language `code`. [Source read](/workspace/data/ml/data/pyspark_job/nodes.py:550) · [Data lineage, F02A](/workspace/data/.local/MLDE-663-allLangs-feature.md:138)
+
+`prepare_account_language` already groups those rows by `account_id` and produces the existing scalar `language` with `any_value(code)`. We can add `sort_array(collect_set(code)) AS all_langs` to that same aggregation and carry it through the existing join. That gives us a sorted array of distinct codes from the same read. [Current aggregation](/workspace/data/ml/data/pyspark_job/nodes.py:65)
+
+
+Q:
+
+› Yes, exactly. But I'm curious, why on earth do we need two language fields (language, locale) in target dataset?
+
+
+A:
+
+• For **GYML GNN**, the two columns in the node dataset are `lang` and `language`. `locale` is the intermediate name for `user_profile_snapshot.language_code`, which Spark uses to derive `lang`. [Source lineage, F02A](/workspace/data/.local/MLDE-663-allLangs-feature.md:138)
+
+The two columns come from different generations of the pipeline. The older `pre-MLDE-533` graph uses `indexed_lang`. The current checked-in graph uses `indexed_language`, derived from an arbitrary code in the `account_languages` dump. The shared Spark transform still produces both, but the current model uses only one. That explains the duplication in code. I haven’t found evidence that the current model needs both. [Older graph](/workspace/data/ml/configs/archive/pre-MLDE-533/graph/graph.yaml:16) · [Current graph](/workspace/data/ml/configs/graph/graph.yaml:216)
+
+For MLDE-663, we agreed to add the new columns alongside the existing ones. Retiring the old columns fits the deferred data-flow audit.
+
+
+Q:
+
+› OK, got it, thanks. Pity I can't ask the author about this decisions. Meanwhile, we should accumulate this findings about attributes and features (along with data samples) in some dedicated doc. Let it be '.local/gyml-data-investigation.md'.
+
+
+A:
+
+• I’ll create the investigation document with the verified language and geography paths, the relevant columns from your data samples, and the open questions for the later audit.
+
+• Created [.local/gyml-data-investigation.md](/workspace/data/.local/gyml-data-investigation.md) and linked it from the [MLDE-663 audit follow-up](/workspace/data/.local/MLDE-663-allLangs-feature.md:396).
+
+It records the profile and account-language samples, traces the language and geography fields through both models and Redis, and captures the open questions for the later audit. All six sections have stable IDs. I checked all 18 source references.
+
+
+Q:
+
+› No, no questions. This doc for facts and derived information about gyml data.
+
+
+A:
+
+• I’ll remove the audit questions and keep the document focused on facts, samples, and conclusions drawn from them.
+
+• Removed the audit questions from [gyml-data-investigation.md](/workspace/data/.local/gyml-data-investigation.md). It now contains only the data samples, verified lineage, and findings derived from that evidence.
+
+
+Q:
+
+› OK, lets get back to pipeline design. Any open questions about gyml data prep?
+
+
+A:
+
+• I’ll check the design notes for decisions still open in GYML GNN data preparation.
+
+• One open question for GYML GNN data prep: **what should `all_langs` contain when the account-language join finds no row?** The existing left join would produce `null`. I’d normalize it to `[]` so the field is always an array and downstream code has one representation for “no known languages.” [D03](/workspace/data/.local/MLDE-663-allLangs-feature.md:296)
+
+The rest is settled. `primary_lang` comes directly from the existing profile read, and `all_langs` is a sorted array of distinct codes from the existing account-language aggregation. Both fields go through the existing joins and must be explicitly carried into the transformed user dataset, since `GnnTransformsJob` selects its output columns by name. [Transform projection](/workspace/data/ml/data/pyspark_job/transforms.py:237)
+
+
+Q:
+
+› Empty list as default value looks good.
+
+
+A:
+
+• I’ll record `[]` as the default for `all_langs` in the GYML GNN dataset contract.
+
+• Recorded in [D03](/workspace/data/.local/MLDE-663-allLangs-feature.md:296). `all_langs` will be a sorted, distinct array of language codes and will default to `[]` when no codes are available. That closes the last open question for GYML GNN data preparation.
+
+
+Q:
+
+› OK, what about filter and transform steps of a data prep pipeline? Existing 'lang', 'language' processed there?
+
+
+A:
+
+• I’ll trace `lang` and `language` through both steps and check where the new fields need to be passed through.
+
+• Yes. **`filters` passes `lang` and `language` through as-is.** It filters graph edges using node eligibility and keeps the original user-node columns while adding flags and degree features. `primary_lang` and `all_langs` will pass through the same way. [Filter step](/workspace/data/ml/data/pyspark_job/filters.py:242)
+
+**`transforms` keeps both original strings and adds `indexed_lang` and `indexed_language`** using Spark `StringIndexer`. Its `SQLTransformer` names the columns it keeps, so we need to add `primary_lang` and `all_langs` to that projection if they’re to reach the training dataset. [Projection](/workspace/data/ml/data/pyspark_job/transforms.py:238) · [Indexers](/workspace/data/ml/data/pyspark_job/transforms.py:324)
+
+There’s one compatibility detail. Regular inference loads the Spark `PipelineModel` saved during training. An older saved pipeline still has the old column list, so it will drop the two new columns even if `nodes` produces them. I recorded that in [F02B](/workspace/data/.local/MLDE-663-allLangs-feature.md:165).
+
+
+Q:
+
+› OK, so we need to add indexer for primary_lang?
+
+
+A:
+
+• Yes, when we want GYML GNN to **use** `primary_lang` as a categorical model input. We’d fit a `StringIndexer` during training to produce `indexed_primary_lang`, then reuse the fitted mapping in regular inference, just as we do for `indexed_language`. We’d also add `indexed_primary_lang` to the graph and model configs. [Existing indexers](/workspace/data/ml/data/pyspark_job/transforms.py:324)
+
+For the data-prep step alone, adding `primary_lang` to the transform’s column list is enough to carry the raw string into the training dataset.
+
+
+Q:
+
+› No, in this task we don't touch training process. Only data prep. So no changes in graph and/or model config.
+
+
+A:
+
+• I’ll update the task notes to scope MLDE-663 to data preparation and defer model integration.
+
+• Understood. MLDE-663 ends at the prepared datasets. For GYML GNN, `nodes` adds `primary_lang` and `all_langs`, `filters` passes them through, and `transforms` keeps both as raw columns in its output. No new indexer or changes to training, graph configs, or model configs. I updated the [scope](/workspace/data/.local/MLDE-663-allLangs-feature.md:21) and [dataset contract](/workspace/data/.local/MLDE-663-allLangs-feature.md:308).
+
+
+Q:
+
+› Why no indexer? I think we decided before that we need a new indexer?
+
+
+A:
+
+• I assumed that “data prep only” meant emitting just the two raw columns. That was too narrow. `StringIndexer` runs in Spark’s `transforms` step and can produce `indexed_primary_lang` without any changes to model training, `graph.yaml`, or `gnn.yaml`.
+
+We discussed the indexer earlier, but its inclusion wasn’t explicitly settled. If the intent is to prepare `primary_lang` the same way as the existing `lang` and `language` columns, then yes: retain the raw `primary_lang`, add `indexed_primary_lang` in `transforms`, and reuse the fitted Spark mapping in regular inference. `all_langs` stays an array.
+
+
+Q:
+
+› Data prep pipeline include all processing before 'train' stage of an AF dag. In the end of a data prep we should have a dataset (parquet) on S3, which will be read by train process. Clear enough?
+
+
+A:
+
+• I’ll record the prepared S3 Parquet as the boundary and include the Spark indexer in the data-prep plan.
+
+• Yes. Data prep runs through the Spark transforms and ends with the S3 Parquet that Airflow’s `train` stage reads. For GYML GNN, that Parquet will contain `primary_lang`, `indexed_primary_lang`, and `all_langs`. The Spark indexer belongs in data prep, and regular inference reuses its fitted mapping.
+
+I updated the [scope](/workspace/data/.local/MLDE-663-allLangs-feature.md:21) and [dataset contract](/workspace/data/.local/MLDE-663-allLangs-feature.md:309). Training logic and the graph and model configs are outside this task.
+
+
+Q:
+
+› Wonderful! Now about 'all_langs'. I think we should look at existing (in target dataset) colums with similar data type: list of strings. How do we filter-transform them?
+
+
+A:
+
+• I’ll check which string-array columns survive into the GYML GNN training Parquet and how Spark handles them along the way.
+
+• The current **GYML GNN training Parquet has no `array<string>` feature**. The closest examples start as lists or sets, then become scalar columns during data prep:
+
+- **Goals:** `prepare_account_goals` collects distinct strings into a temporary `goals` array, then emits a `has_goal_*` flag for each known goal. [Goal preparation](/workspace/data/ml/data/pyspark_job/nodes.py:84)
+- **Platforms:** `prepare_account_platforms` pivots platform codes into counts. The transform converts those counts into `has_*_platform` flags. [Platform preparation](/workspace/data/ml/data/pyspark_job/nodes.py:76) · [Transform](/workspace/data/ml/data/pyspark_job/transforms.py:253)
+
+The closest precedent for `all_langs` is in the separate test-segment job. It already collects language codes with `sort_array(collect_set(code))`, then converts them to an array of structs for its own output. [Test-segment aggregation](/workspace/data/ml/data/pyspark_job/segments.py:803)
+
+For our data-prep scope, I’d keep `all_langs` as a sorted `array<string>`. The filter step already preserves input columns, and the transform can carry the array through its explicit projection. I recorded the comparison in [GYML-DATA-07](/workspace/data/.local/gyml-data-investigation.md:122).
+
+
+Q:
+
+› OK, lets do that. Probably we will change that, when we discover how to produce ML feature for the model. But it is out of the scope now.
+
+
+A:
+
+• I’ll implement the agreed GYML GNN data-prep changes through the transformed Parquet. `all_langs` will stay an array, and Spark will index `primary_lang` in the existing transform step.
+
+
+Q:
+
+› wait a sec
+
+
+A:
+
+• Paused. I’ve only inspected the code and tests. No files changed.
+
+
+Q:
+
+› Are you working on implementation of our design?
+
+
+A:
+
+• I interpreted “let’s do that” as approval to implement the GYML GNN data-prep changes. I reviewed the code and tests, then paused before editing. No implementation changes have been made.
+
+
+Q:
+
+› Before we begin with implementation, do we have any open questions or doubts about gyml data prep design?
+
+
+A:
+
+• One open question: **do existing GYML GNN indices need the new columns in their regular inference Parquet immediately?**
+
+Training data prep can write `primary_lang`, `indexed_primary_lang`, and `all_langs` and save the fitted Spark pipeline. Regular inference for an existing index loads that index’s saved `PipelineModel`. Older artifacts omit the new columns and the new indexer, so deploying an updated ML ZIP alone won’t add them to the transformed inference dataset. [Saved pipeline behavior, F02B](/workspace/data/.local/MLDE-663-allLangs-feature.md:165)
+
+My preference is to introduce the new schema when data prep fits a pipeline for a **new index ID**. That preserves the category mappings expected by existing models. If existing indices need the new columns immediately, we should design that artifact migration separately.
+
+The rest of GYML GNN data prep is settled: reuse the existing sources, filters, and joins, default `all_langs` to `[]`, and fit `indexed_primary_lang` in Spark.
+
+
+Q:
+
+› The answer is 'no'. New logic will be used to train new models and build new indices. In ml we use package versioning, so old models/indices will be using old code from their respective versions. By the way, we should update minor part of ml package version.
+
+
+A:
+
+• I’ll record the new-index rollout decision and check the current ML package version so the release notes name the exact bump.
+
+• Recorded in [D06](/workspace/data/.local/MLDE-663-allLangs-feature.md:369). New models and index IDs will use the updated data prep and fit their own Spark pipeline. Existing indices keep their pinned ML packages and fitted pipelines.
+
+The minor bump is **`3.1.0` → `3.2.0`**, published as `v3.2.0-dev` for development and `v3.2.0` for production. The version file will be updated after the MR merges into `develop`, per the release procedure. That settles the GYML GNN data-prep design.
+
+
+Q:
+
+› We could safely update version now, no need to wait for merge with 'develop'. And make a note that we have to update CHANGELOG also.
+
+
+A:
+
+• I’ll bump the ML package to `3.2.0` now and record the changelog update as a release task.
+
+• Bumped the ML package from `3.1.0` to `3.2.0` and verified that CI’s version parser reads it correctly. [Version file](/workspace/data/ml/package-version.txt)
+
+Recorded the follow-up to add the `3.2.0` entry to `ml/CHANGELOG.md` before merging into `main`. [D06](/workspace/data/.local/MLDE-663-allLangs-feature.md:369)
+
+
+Q:
+
+› Great! Are we ready for implementation?
+
+
+A:
+
+• Yes. We’re ready to implement **GYML GNN data prep** first.
+
+- `nodes` will add `primary_lang` from the profile snapshot and `all_langs` from the account-language dump, using the existing joins and filters. Missing language lists become `[]`.
+- `filters` already passes the new columns through. `transforms` will retain both and fit a Spark indexer for `indexed_primary_lang`.
+- New indices will use the updated package and fitted Spark pipeline. Model training and graph configuration are outside this step.
+
+The `3.2.0` bump is in place. [Dataset contract](/workspace/data/.local/MLDE-663-allLangs-feature.md:317) · [Rollout decision](/workspace/data/.local/MLDE-663-allLangs-feature.md:369)
+
+
+Q:
+
+› Lets go
+
+
+A:
+
+• I’ll implement the GYML GNN changes in `nodes` and `transforms`, then test the language values, empty-list default, and saved Spark indexer.
+
+• Implemented GYML GNN data prep. The prepared Parquet now includes `primary_lang` from the profile, `all_langs` as a sorted, distinct `array<string>` with `[]` as the default, and `indexed_primary_lang` from the fitted Spark indexer. Both fields use the existing sources, joins, and filters. [Implementation notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:460)
+
+Local verification passed **21 tests**, with **17 pre-existing skips**. The transform test reloads the fitted pipeline and checks the actual Parquet output, including missing and unseen languages. EMR and S3 execution remain unverified.
+
+
+Q:
+
+› Super, thanks! I let you know review results
+
+
+A:
+
+• Sounds good. I’ll wait for your review before moving on to GYML-online.
+
+
+Q:
+
+› Interesting, in our design we recorded that 'primary_lang' we getting from user profile, no?
+
+
+A:
+
+• I’ll check the design note against the implementation and trace the `locale` alias back to the profile query.
+
+• Yes. The design and implementation both use `analytics.user_profile_snapshot.language_code`. The confusing part is that the existing SQL query aliases `language_code` to `locale`. [Design decision, D05](/workspace/data/.local/MLDE-663-allLangs-feature.md:353) · [Profile query](/workspace/data/ml/common/__init__.py:44)
+
+The path is `user_profile_snapshot.language_code` → `locale` → `primary_lang`. Spark carries the original code through the existing profile join, so `en-US` stays `en-US` in `primary_lang`. The legacy `lang` column still takes the first part, `en`. [Spark projection](/workspace/data/ml/data/pyspark_job/nodes.py:42)
+
+
+Q:
+
+› From where you get that 'original code ... en-US'? I gave you the data sample, there no such thing. Am I hallucinating?
+
+
+A:
+
+• You’re right. Your sample showed `en`, `ru`, and a blank value. I introduced `en-US` as a synthetic test value to verify that `primary_lang` preserves the full input string. I should have labeled it as a test example. [Test fixture](/workspace/data/ml/tests/test_data_pyspark_job_nodes.py)
+
+For your sample, `primary_lang` receives `en` and `ru` directly from the profile’s `language_code`.
+
+
+Q:
+
+› If you have a test that use non-existing data shape, it is a wrong test. It make sense to check that old 'lang' do the split in both cases: 'en-US', and just 'en', not the other way around.
+
+
+A:
+
+• I’ll use the observed profile codes in the `primary_lang` tests and cover `en-US` separately as an input to the legacy `lang` split.
+
+• Corrected the tests. The `primary_lang` fixtures now use bare language codes. A separate test verifies that legacy `lang` produces `en` for both `en-US` and `en`. [Legacy split test](/workspace/data/ml/tests/test_data_pyspark_job_nodes.py:213)
+
+**22 tests passed**, with 17 pre-existing skips.
+
+
+Q:
+
+› Ah, I get it. This 'locale' mix-up is inhereted from the time when 'LocaleDump' source was used. OK, mistery solved. Well, now we use user profile, and we can simplify things. For example, in 'def prepare_account_lang(locale: DataFrame) -> DataFrame:' we don't need 'groupBy' as profile already have unique account_id. But we need to filter if 'account_id > 0'. Am I right?
+
+
+A:
+
+• Yes on both points. `analytics.user_profile_snapshot` already returns at most one row per registered `account_id`, so `prepare_account_lang` can use a row-level `select`. The `groupBy`, `max(struct(...))`, and synthetic `id` are redundant for this source. [Snapshot SQL](/workspace/gameram-dwh/gameram_dbt/models/marts/analytics/user_profile/user_profile_snapshot.sql:69) · [Spark helper](/workspace/data/ml/data/pyspark_job/nodes.py:42)
+
+Keep `account_id > 0` as the registered-user rule. The ClickHouse query already enforces it, so the Spark helper doesn’t need to repeat it. The simpler projection can still derive legacy `lang` with the split and copy the original profile language code directly into `primary_lang`. [Source query](/workspace/data/ml/common/__init__.py:58)
+
+
+Q:
+
+› OK, lets rework 'def prepare_account_lang(locale: DataFrame) -> DataFrame:
+
+
+A:
+
+• I’ll simplify `prepare_account_lang` to a row-level projection and keep its current filters and legacy split.
+
+• `prepare_account_lang` now projects each profile row directly. The snapshot already provides at most one row per registered account, so the helper no longer groups rows or uses the synthetic `id`. The ClickHouse query still enforces `account_id > 0`, and the helper still derives legacy `lang` and copies the profile code into `primary_lang`. [Implementation](/workspace/data/ml/data/pyspark_job/nodes.py:42)
+
+**22 tests passed**, with 17 pre-existing skips.
+
+
+Q:
+
+› OK, I need you to explain to me, what exactly tested in test involved in this change?
+
+
+A:
+
+• I’ll read the changed assertions and separate what they check in the helper, the joins, and the final Parquet.
+
+• The change is covered by three Spark tests, each checking a different step.
+
+| Test | What it checks |
+|---|---|
+| **Legacy `lang` split** | Calls `prepare_account_lang` with `en-US` and `en` and checks that both produce `lang = "en"`. The input has no synthetic `id` column, so this also verifies that the simplified helper can run without it. The test asserts only the legacy `lang` output. [Test](/workspace/data/ml/tests/test_data_pyspark_job_nodes.py:213) |
+| **Account feature joins** | Runs both language preparation helpers and the existing joins. For account 1, the profile yields `primary_lang = "en"`, and the dump rows `ru, en, ru, null` yield `all_langs = ["en", "ru"]`. Account 5 has neither a profile nor language rows and still appears with `primary_lang = null` and `all_langs = []`. The test also checks existing account eligibility, activity, and region values. [Test](/workspace/data/ml/tests/test_data_pyspark_job_nodes.py:224) |
+| **Saved transform and Parquet output** | Fits the Spark pipeline on two eligible rows, saves it, reloads it in inference mode, and writes and rereads local Parquet. It checks that the raw fields survive, `all_langs` is `array<string>`, known primary languages get indices `0` and `1`, and unseen and missing values both get index `2`. [Test](/workspace/data/ml/tests/test_data_pyspark_job_transforms.py:237) |
+
+The inputs are in-memory Spark fixtures. The tests cover the transformation and output, while profile uniqueness and `account_id > 0` come from the ClickHouse source query.
+
+
+Q:
+
+› transform test checks only schema or values also?
+
+
+A:
+
+• Both. After rereading the Parquet, the test checks that `all_langs` has type `array<string>` and asserts the exact values for all four fixture accounts. [Assertions](/workspace/data/ml/tests/test_data_pyspark_job_transforms.py:245)
+
+| `primary_lang` | `indexed_primary_lang` | `all_langs` |
+|---|---:|---|
+| `en` | `0` | `["en", "ru"]` |
+| `it` | `1` | `["it"]` |
+| `ja` (unseen during fitting) | `2` | `["ja"]` |
+| `null` | `2` | `[]` |
+
+
+Q:
+
+› Perfect, thanks!
+
+
+A:
+
+• You’re welcome!
+
+
+Q:
+
+› Export today’s session, please
+
+
+A:
+
+• I’ll use the export-session-dialog skill to save today’s conversation as a Q/A Markdown file.
