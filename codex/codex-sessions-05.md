@@ -3,8 +3,7 @@
 
 ```sh
 # host
-pushd ${HOME:?unknown}/data/github/ai-sandbox/codex/setup-v2
-export PROJECT_ROOT=${HOME:?unknown}/data/gitlab/gameram
+pushd ${HOME:?unknown}/data/github/ai-sandbox/codex/setup-v2 && export PROJECT_ROOT=${HOME:?unknown}/data/gitlab/gameram
 docker compose start # ps # stop # start # exec codex bash
 docker compose exec codex bash
 # container
@@ -2730,3 +2729,528 @@ Q:
 A:
 
 • I’ll use the export-session-dialog skill to save today’s conversation as a Q/A Markdown file.
+
+## 2026-11-27 gyml features
+
+Q:
+
+› Hi, where were we?
+
+
+A:
+
+• I’ll check the branch and MLDE-663 notes for where we left off.
+
+• We finished the **GYML GNN data-prep** part of MLDE-663. Commit `cc425cab` adds `primary_lang`, `indexed_primary_lang`, and `all_langs` to the prepared dataset. The ML package is at `3.2.0`, and the branch is clean and in sync with `origin`. Local validation ended with **22 passed and 17 pre-existing skips**. [Implementation notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:465)
+
+Next is **GYML-online data prep**. We already traced its language sources. The next design decision is how `GymlOnlinePrepareDatasetJob` will read the profile snapshot for `primary_lang` alongside the hourly `account_languages` dump it already reads. Training and serving changes are deferred. The `3.2.0` changelog entry is still pending. [Online lineage](/workspace/data/.local/MLDE-663-allLangs-feature.md:226) · [Release follow-up](/workspace/data/.local/MLDE-663-allLangs-feature.md:369)
+
+
+Q:
+
+› OK, got it. Before we continue, I want to do a little refactoring related to user-profile data source. In 'CH_QUERY_TEMPLATES' we have 'locale' data source that is actually a user-profile data source. It was 'LocaleDump' earlier and we replaced it with profile as transparent as we could. Now, after acceptance of profile data, we can safely change data source name, column names from 'LocaleDump' specific values to original profile values. In 'SOURCE_SCHEMAS_DDL' we have related DDL that should reflect changes also. Can you trace all direct consumers of this data source and make a suggestion, how we refactor that with minimal effort?
+
+
+A:
+
+• I’ll trace the `locale` template and DDL through the shared reader, then identify the smallest refactor that preserves downstream outputs.
+
+• I found one production caller of the ClickHouse source `"locale"`: `GNNUserFeaturesJob.load_user_sources`. It passes the result to `prepare_account_lang`, which reads only `account_id`, `locale`, and `region`. The node tests build fixtures with that same schema. GYML-online’s `locale` feature comes from a separate source. [Source read](/workspace/data/ml/data/pyspark_job/nodes.py:505) · [Projection](/workspace/data/ml/data/pyspark_job/nodes.py:42)
+
+The smallest refactor is:
+
+1. Rename the source key to `user_profile_snapshot` in `CH_QUERY_TEMPLATES`, `SOURCE_SCHEMAS_DDL`, and `load_user_sources`. Select only `account_id`, `language_code`, and `country_code` under their native names. Keep the current date/hour and eligibility conditions. [Source definitions](/workspace/data/ml/common/__init__.py:44)
+2. In `prepare_account_lang`, read the native names and preserve the output columns. `language_code` still supplies split-based `lang` and direct `primary_lang`. `country_code` still supplies `country`.
+3. Remove the obsolete timestamp fallback and update the node test fixtures. The source key is internal to the ML package, so this requires no Airflow argument or YAML changes. [Query renderer](/workspace/data/ml/common/path_resolver.py:241)
+
+I recorded the proposal in [D07](/workspace/data/.local/MLDE-663-allLangs-feature.md:389).
+
+
+Q:
+
+› Yes, I agree with that plan. Lets do this
+
+
+A:
+
+• I’ll rename the source to `user_profile_snapshot`, use the native column names, and verify that the node feature outputs stay the same.
+
+• Renamed the ClickHouse source from `locale` to `user_profile_snapshot`. The query and Spark DDL now use just three native columns: `account_id`, `language_code`, and `country_code`. `prepare_account_lang` reads those names and still produces `lang`, `primary_lang`, and `country` for the existing join. [Source definition](/workspace/data/ml/common/__init__.py:42) · [Node projection](/workspace/data/ml/data/pyspark_job/nodes.py:42)
+
+**44 tests passed**, with 17 pre-existing skips. The new test checks the projected columns, DDL, eligibility filters, and reference hour. [Test](/workspace/data/ml/tests/test_common_path_resolver.py:17) · [Task notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:389)
+
+
+Q:
+
+› Perfect, commited. Another little detail: lets declare old 'lang' and 'language' columns in target dataset as deprecated. I don't remember how it is done in python, probably some comments or docstring should be enough. And we should reflect it in related docs, if any
+
+
+A:
+
+• I’ll mark the two raw columns as deprecated in the transform code and dataset docs, and document the current dependency on `indexed_language`.
+
+• Marked `lang` and `language` as deprecated in the transformed GYML GNN dataset. The docs point new consumers to `primary_lang` and `all_langs` and explain that the current graph still uses `indexed_language`. [Code comment](/workspace/data/ml/data/pyspark_job/transforms.py:242) · [Dataset docs](/workspace/data/ml/data/pyspark_job/README.md:356)
+
+Black and `git diff --check` passed.
+
+
+Q:
+
+› OK, but you don't mark it in 'nodes.py', why?
+
+
+A:
+
+• I marked the final projection and missed where the raw columns are created. I’ll add the deprecation comments in `nodes.py` too.
+
+• I missed the column definitions. Both are now marked deprecated where they’re created in [nodes.py](/workspace/data/ml/data/pyspark_job/nodes.py:50), with comments naming the indexers that still use them. Black and `git diff --check` passed.
+
+
+Q:
+
+› Great, commited.
+
+
+A:
+
+• That wraps up the GYML GNN changes. Next up is GYML-online data prep.
+
+
+Q:
+
+› One more side-step, if I may. I want to remove unwanted and unused files from '/workspace/data/'. The main citeria for 'used' files is that they tracked by git. All untracked files are, potentially, 'unused'. But not all of them, e.g. our docs in '.local' directory. Any suggestions how to remove unused files but save some of them?
+
+
+A:
+
+• I’d use **Git as the inventory and an explicit keep list for local files**. Start with a dry run from `/workspace/data`:
+
+```bash
+git clean -nd -e '/.local/'
+```
+
+This previews untracked files and directories while respecting Git’s ignore rules and protecting `.local/`. After reviewing the list, use interactive mode to select what to remove:
+
+```bash
+git clean -di -e '/.local/'
+```
+
+Ignored files are a separate pass. They can include `.venv` directories, build outputs, downloaded artifacts, and local configuration. To inspect a specific ignored directory, scope the dry run to that path:
+
+```bash
+git clean -ndx -- path/to/review/
+```
+
+Move anything you’re unsure about into `.local/cleanup-hold/` before cleaning. I’d avoid a repository-wide `git clean -fdx` here because it also removes ignored files.
+
+
+Q:
+
+› Yes, I was thinking along those lines too. OK, I'll do it when I have time. I hope those unused files don't affect your efficiency?
+
+
+A:
+
+• Usually they don’t. `rg` skips ignored directories such as `.local/` by default, and I use `git ls-files` when I need to see only tracked files. Extra files mainly add noise during broad searches that explicitly include ignored files, so there’s no need to clean up for my sake.
+
+
+Q:
+
+› Great! OK, back to business. Lets design updated pipeline for gyml-online, using previous work as a base. Probably we should add a focus on a code reuse between gyml and gyml-online, as they are two parts of one system, after all
+
+
+A:
+
+• I’ll compare GYML-online’s Spark job with the GYML GNN changes and look for language logic they can share while keeping each dataset’s existing behavior.
+
+• I’d reuse the language source and aggregation from GYML GNN, while keeping GYML-online’s requester joins and output schema in its own job. I recorded the proposed design in [D09](/workspace/data/.local/MLDE-663-allLangs-feature.md:431).
+
+1. **Share the language extraction.** Move `prepare_account_language` from `nodes.py` into a small shared PySpark module. Both jobs already read the hourly `account_languages` dump, so they can use the same aggregation for the existing scalar `language` and the new sorted, distinct `all_langs`.
+2. **Reuse the profile reader.** In `GymlOnlinePrepareDatasetJob.lift`, read `user_profile_snapshot` at `run_dth` through the same ClickHouse reader as GYML GNN. Left-join `language_code` as `primary_lang` by requester `account_id`. A missing profile yields `null`, and a missing language list yields `[]`. The existing `locale` continues to come from the scalar `language`.
+3. **Wire the source into Airflow.** Pass the existing ClickHouse config path and secret ID to the EMR job, and wait for `dimensions__hourly.run__user_profile_history` at the requested hour. The EMR submission already includes the JDBC driver.
+
+I’d write both fields in their raw types to the **GYML-online S3 Parquet**. GYML GNN already has a fitted Spark transform pipeline. GYML-online currently encodes language in the model code, so adding a Spark indexer there would introduce a second encoding path.
+
+The main decision to confirm is **profile eligibility**. Reusing the query as-is means GYML-online gets `primary_lang` only when the profile has a non-null `language_code` and `country_code`, just like GYML GNN. I’d use that shared rule for this change.
+
+
+Q:
+
+› I like it, sound logic! Lets do this
+
+
+A:
+
+• I’ll wire GYML-online to the shared profile reader and language aggregation, then add the Airflow dependency and verify the prepared Parquet.
+
+• The Spark and Airflow tests passed. I’ll now check that both jobs import the shared helper from a packaged ML ZIP.
+
+• Implemented GYML-online data prep. The requester’s `primary_lang` now comes from the same ClickHouse profile snapshot as GYML GNN. Both Spark jobs share the aggregation for `all_langs`, which is a sorted, distinct array and defaults to `[]`. The existing `locale` still comes from the account-language dump. [Shared helper](/workspace/data/ml/data/pyspark_job/language_features.py) · [Dataset preparation](/workspace/data/ml/data/pyspark_job/gyml_online.py:180)
+
+Airflow now waits for the profile snapshot at `run_dth` alongside the existing S3 checks. I gave `data_collect` its own `v3.2.0-dev` package pin so training can keep its current pin. Publish that ZIP before deploying the updated DAG. [DAG](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py:44)
+
+**44 ML tests passed** with 17 pre-existing skips, **25 Airflow tests passed**, and both jobs imported the shared helper from a local ML ZIP. Live ClickHouse and EMR execution remain unverified. [Implementation notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:432)
+
+
+Q:
+
+› I'm reviewing changes. I think that 'def profile_execution_date' is too specific to be placed in such common package. It uses 'run_dth' parameter which nobody set except two gyml dags. We should give that function more specific name and put in gyml package. Am I wrong?
+
+
+A:
+
+• I’ll check where the callback belongs in the GYML package and move it there, keeping the reusable sensor in the shared package.
+
+• Agreed. The callback interprets GYML’s `run_dth`, so I moved it to `batch.gyml.common` and renamed it `gyml_user_profile_execution_date`. Both training DAGs use it. The generic sensor factory stays in `extentions.sensors.external_tasks`. [GYML callback](/workspace/data/airflow/dags/batch/gyml/common.py:20)
+
+I also updated the test and docs to match your `train_ml_package_version` rename. All 25 GYML Airflow tests passed.
+
+
+Q:
+
+› OK, but I'm not sure why it contain 'user_profile' in its name, the function just convert run_dth to DateTime, is it not?
+
+
+A:
+
+• Yes, it parses `params["run_dth"]` as a UTC datetime. I’ll rename it to reflect that.
+
+• Renamed it to `gyml_run_dth_execution_date`. It parses `params["run_dth"]` as a UTC datetime, and both GYML DAGs use it as their sensor callback. All 25 GYML Airflow tests passed. [Callback](/workspace/data/airflow/dags/batch/gyml/common.py:21)
+
+
+Q:
+
+› Super, I'll let you know the result of review
+
+
+A:
+
+• Sounds good. I’ll wait for your review.
+
+
+Q:
+
+› Wonderful job, thanks! Approved and commited.
+
+
+A:
+
+• Thanks for the review. That wraps up the data-prep changes for both GYML GNN and GYML-online.
+
+
+Q:
+
+› Nearly there. We should mark 'locale' and 'language' as deprecated in gyml-online
+
+
+A:
+
+• I’ll mark `language` and `locale` as deprecated in GYML-online data prep and document why the current model still uses `locale`.
+
+• Marked GYML-online’s intermediate `language` column and Parquet `locale` field as deprecated. The current model still reads `locale`. The docs point new dataset consumers to `primary_lang` and `all_langs`. [Dataset docs](/workspace/data/ml/gyml/online/README.md:140) · [Decision D10](/workspace/data/.local/MLDE-663-allLangs-feature.md:480)
+
+Black and `git diff --check` passed.
+
+
+Q:
+
+› Good, commited. Now we should check that airflow dag for regular gyml inference can use different versions of the ml package for different models (indices), registered in 'meta' global variable
+
+
+A:
+
+• I’ll trace each index’s package version through the regular inference DAG and verify which ZIP the EMR steps would receive.
+
+• Yes. `gyml_gnn_user_index_update_v2` uses `GYML_GNN_USER_INDEX_META[index_id]["package_version"]` independently for each index. The current metadata pins `MLDE-468-new` to `v3.0.0` and `MLDE-479-nbclean` to `v3.0.1`. An index must also exist in Redis for the DAG to schedule it. [Metadata](/workspace/data/airflow/dags/batch/gyml/__init__.py:66) · [Index selection](/workspace/data/airflow/dags/batch/gyml/gyml_gnn_inference_data_v2.py:106)
+
+I verified locally that all **13 PySpark steps per index** get both `ml_package_files.zip` and `pyspark_runner.py` from that index’s version prefix. The Scala segment and Redis update steps use the shared ETL JAR. All six package-config tests passed. This verifies step generation with mocked Redis discovery. Live EMR execution and S3 artifacts were outside the check. [Verification notes, F06](/workspace/data/.local/MLDE-663-allLangs-feature.md:543)
+
+
+Q:
+
+› I need your opinion on this: should we (in the future) add an option that allow to use different ml package versions for data-collect and inference steps for the same index?
+
+
+A:
+
+• I’d keep one `package_version` per index by default. I’d add a per-index override only if we have a recurring need to release data-prep fixes independently of inference. A source-reader fix is a good example: we might want the new reader while keeping the inference code pinned.
+
+If that need comes up, I’d add an optional `data_prep_package_version` for `nodes`, `edges`, `filters`, and `transforms`. The inference dataset and embeddings steps would keep using `package_version`. Without the override, every PySpark step would use the same pin.
+
+The compatibility check matters more than the two version numbers. The new data-prep package has to load the index’s fitted Spark pipeline and produce the paths, schema, and categorical IDs that its inference package and trained model expect. A schema check alone would miss a change in what a category ID means.
+
+
+Q:
+
+› I think you're right. Option for override only if it is really needed. OK, thanks. You can add this decision to doc, for future development
+
+
+A:
+
+• I’ll record the default and the conditions that would justify a future override.
+
+• Recorded in [D11](/workspace/data/.local/MLDE-663-allLangs-feature.md:562). Keep one `package_version` per index. Add a data-prep override only when there’s a concrete need for independent releases, and verify compatibility with the index’s fitted Spark pipeline and trained model before enabling it.
+
+
+Q:
+
+› Great! Remind me, do we have postponed tasks in this scope?
+
+
+A:
+
+• I’ll check the MLDE-663 notes for deferred work and pending release items.
+
+• Both data-prep changes are committed. The notes track four deferred items:
+
+- **GYML GNN validation and test DAGs** — trace `gyml_gnn_valid_dataset` and `gyml_gnn_test_pipeline_v2` separately. [D02](/workspace/data/.local/MLDE-663-allLangs-feature.md:310)
+- **Model and serving integration** — decide how the models consume the new fields and how GYML-online receives them at serving time. [D04](/workspace/data/.local/MLDE-663-allLangs-feature.md:346)
+- **GYML data-flow audit** — trace legacy fields and their active consumers before cleanup. [A01](/workspace/data/.local/MLDE-663-allLangs-feature.md:576)
+- **Per-stage package override** — revisit only if a concrete need arises to release data prep independently of inference. [D11](/workspace/data/.local/MLDE-663-allLangs-feature.md:562)
+
+For this release, the **`3.2.0` changelog entry** is still pending. The updated GYML-online DAG also needs the `v3.2.0-dev` package published before deployment. [Release notes](/workspace/data/.local/MLDE-663-allLangs-feature.md:375) · [GYML-online rollout](/workspace/data/.local/MLDE-663-allLangs-feature.md:432)
+
+
+Q:
+
+› OK, changelog. Lets add record to ml's changelog, according to project's conventions
+
+
+A:
+
+• I’ll check the format of recent ML changelog entries and add the `3.2.0` entry in the same style.
+
+• Added the Russian `MLDE-663, ml_package 3.2.0` entry to the [ML changelog](/workspace/data/ml/CHANGELOG.md:1). It covers the new language fields in both datasets, the GYML GNN Spark indexer, and the deprecated columns. Updated the task notes. `git diff --check` passed.
+
+
+Q:
+
+› Good, thanks. Now we should prepare merge-request description for gitlab. Remind me, do we have instructions to add deployment notes to description?
+
+
+A:
+
+• I’ll check the GitLab MR description skill for what it says about deployment notes.
+
+• Yes. The GitLab MR description skill says to include deployment and compatibility details when they matter to reviewers. It leaves the section format flexible. [Skill instructions](/home/dev/.codex/skills/gitlab-mr-description/SKILL.md:10)
+
+For MLDE-663, I’d add a short **Развёртывание** section to the full description. It should say to publish `v3.2.0-dev` before deploying the updated GYML-online DAG, fit the Spark pipeline during data prep for each new GYML GNN index, and keep existing indices on their pinned packages. [Rollout decisions](/workspace/data/.local/MLDE-663-allLangs-feature.md:375)
+
+
+Q:
+
+› OK, give me MR desription, in markdown
+
+
+A:
+
+• I’ll use the GitLab MR description skill and check the branch diff against `develop` before drafting all three Markdown versions.
+
+• `feature/MLDE-663-allLangs-feature` → `develop`
+
+## Краткое описание
+
+В подготовленные датасеты GYML GNN и GYML-online добавлены `primary_lang` из профиля пользователя и `all_langs` из дампа `account_languages`. Для GYML GNN Spark также формирует `indexed_primary_lang`. Версия ML-пакета повышена до `3.2.0`.
+
+## Оптимальное описание
+
+Добавлены языковые поля в Parquet, который читают процессы обучения GYML GNN и GYML-online. `primary_lang` берётся из `analytics.user_profile_snapshot`, а `all_langs` содержит отсортированный массив уникальных кодов из `account_languages` и по умолчанию равен `[]`. Оба Spark-джоба используют общую агрегацию. В GYML GNN этап `transforms` дополнительно формирует `indexed_primary_lang`.
+
+DAG `gyml_online_train` теперь ждёт готовности профиля за `run_dth` и передаёт EMR параметры ClickHouse. Прежние языковые поля объявлены устаревшими и сохранены для совместимости. Перед выкладкой обновлённого DAG нужно опубликовать ML-пакет `v3.2.0-dev`.
+
+## Полное описание
+
+Подготовить основной язык и список всех языков пользователя для будущего использования в моделях GYML GNN и GYML-online. Изменения ограничены подготовкой данных до записи итогового Parquet.
+
+### Добавлено
+
+- `primary_lang` из `analytics.user_profile_snapshot.language_code` и `all_langs` из почасового дампа `account_languages` в обоих датасетах. `all_langs` — отсортированный массив уникальных кодов с `[]` по умолчанию.
+- `indexed_primary_lang` в GYML GNN. Spark обучает `StringIndexer` на этапе подготовки данных и сохраняет его в `PipelineModel` для регулярного инференса того же индекса.
+- Общая агрегация языков для обоих Spark-джобов и ожидание `dimensions__hourly.run__user_profile_history` за `run_dth` в `gyml_online_train`.
+
+### Удалено
+
+- Из ClickHouse-проекции профиля убраны совместимые с `LocaleDump` псевдонимы, синтетический `id`, лишние поля и подстановка даты обновления.
+
+### Изменено
+
+- Внутренний источник `locale` переименован в `user_profile_snapshot`. Запрос и Spark DDL используют исходные имена `account_id`, `language_code` и `country_code`.
+- Прежние `lang` и `language` в GYML GNN, а также промежуточный `language` и выходной `locale` в GYML-online объявлены устаревшими и сохранены для совместимости.
+- ML-пакет повышен до `3.2.0`. Обновлён `ml/CHANGELOG.md`.
+
+### Развёртывание
+
+Перед выкладкой обновлённого `gyml_online_train` опубликовать `v3.2.0-dev`. DAG использует эту версию для `data_collect` и `train`. Для нового индекса GYML GNN сначала подготовить данные и сохранить его `PipelineModel`, затем указать версию пакета в `GYML_GNN_USER_INDEX_META`. Существующие индексы продолжают использовать закреплённые версии.
+
+### Проверка
+
+На текущем коммите прошли 43 ML-теста и 23 Airflow-теста. Один ML-тест требует обновить ожидаемый вызов ClickHouse, два Airflow-теста ссылаются на прежние имена параметров версии пакета. Эти имена также остались в двух README. `git diff --check` прошёл. [Детали проверки](/workspace/data/.local/MLDE-663-allLangs-feature.md:563)
+
+
+Q:
+
+› It sure looks nice, but I need markdown text that I could copy/paste to gitlab
+
+
+A:
+
+• ### Краткое описание
+
+```markdown
+В подготовленные датасеты GYML GNN и GYML-online добавлены `primary_lang` из профиля пользователя и `all_langs` из дампа `account_languages`. Для GYML GNN Spark также формирует `indexed_primary_lang`. Версия ML-пакета повышена до `3.2.0`.
+```
+
+### Оптимальное описание
+
+```markdown
+В Parquet для обучения GYML GNN и GYML-online добавлены два поля. `primary_lang` берётся из `analytics.user_profile_snapshot`, а `all_langs` содержит отсортированный массив уникальных кодов из `account_languages` и по умолчанию равен `[]`. Оба Spark-джоба используют общую агрегацию. В GYML GNN этап `transforms` дополнительно формирует `indexed_primary_lang`.
+
+DAG `gyml_online_train` ждёт готовности профиля за `run_dth` и передаёт параметры подключения к ClickHouse в EMR. Прежние языковые поля объявлены устаревшими и сохранены для совместимости. Перед выкладкой обновлённого DAG нужно опубликовать ML-пакет `v3.2.0-dev`.
+```
+
+### Полное описание
+
+```markdown
+В рамках MLDE-663 основной язык и список всех языков пользователя добавлены в подготовленные датасеты GYML GNN и GYML-online. Изменения ограничены подготовкой данных до записи итогового Parquet.
+
+## Добавлено
+
+- `primary_lang` из `analytics.user_profile_snapshot.language_code` и `all_langs` из почасового дампа `account_languages` в обоих датасетах. `all_langs` — отсортированный массив уникальных кодов с `[]` по умолчанию.
+- `indexed_primary_lang` в GYML GNN. Spark обучает `StringIndexer` на этапе подготовки данных и сохраняет его в `PipelineModel` для регулярного инференса того же индекса.
+- Общая агрегация языков для обоих Spark-джобов и ожидание `dimensions__hourly.run__user_profile_history` за `run_dth` в `gyml_online_train`.
+
+## Удалено
+
+- Из ClickHouse-проекции профиля убраны псевдонимы из `LocaleDump`, синтетический `id`, неиспользуемые поля и подстановка даты обновления.
+
+## Изменено
+
+- Внутренний источник `locale` переименован в `user_profile_snapshot`. Запрос и Spark DDL используют исходные имена `account_id`, `language_code` и `country_code`.
+- Поля `lang` и `language` в GYML GNN, а также промежуточный `language` и выходной `locale` в GYML-online объявлены устаревшими и сохранены для совместимости.
+- Версия ML-пакета повышена до `3.2.0`. Обновлён `ml/CHANGELOG.md`.
+
+## Развёртывание
+
+- Перед выкладкой обновлённого `gyml_online_train` опубликовать ML-пакет `v3.2.0-dev`. DAG использует эту версию для `data_collect` и `train`.
+- Для нового индекса GYML GNN сначала подготовить данные и сохранить его `PipelineModel`, затем указать версию пакета в `GYML_GNN_USER_INDEX_META`. Существующие индексы продолжают использовать закреплённые версии.
+
+## Проверка
+
+На коммите `888fa5aa` прошли 43 ML-теста и 23 Airflow-теста. Один ML-тест ожидает позиционные аргументы в моке чтения ClickHouse, а фактический вызов использует именованные аргументы. Два Airflow-теста и два README ещё ссылаются на прежние имена параметров версии пакета. `git diff --check` прошёл.
+```
+
+
+Q:
+
+› Cool, thanks!
+
+
+A:
+
+• You’re welcome!
+
+
+Q:
+
+› Explain, please: "Два Airflow-теста и два README ещё ссылаются на прежние имена параметров версии пакета"
+
+
+A:
+
+• I’ll check the exact references and show how they differ from the current DAG.
+
+• `gyml_online_train` used to have two package version settings, `data_collect_ml_package_version` for data collection and `train_ml_package_version` for training. It now uses one setting, `ml_package_version = "v3.2.0-dev"`, for both stages. [DAG source](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py:42)
+
+- **Two tests in the same file** still use the old names to build the expected S3 ZIP path. Both fail with `AttributeError` while constructing the expected value, before comparing it with the actual task arguments. [Data collection assertion](/workspace/data/airflow/tests/dags/test_gyml_online_train.py:167) · [Training assertion](/workspace/data/airflow/tests/dags/test_gyml_online_train.py:249)
+- **Two READMEs** still describe separate settings. The ML README even shows different versions for collection and training, although the DAG now uses `v3.2.0-dev` for both. [Airflow README](/workspace/data/airflow/dags/batch/gyml/README.md:213) · [ML README](/workspace/data/ml/README.md:260)
+
+The finding concerns stale tests and documentation for the online DAG. The regular GYML inference DAG’s per-index package versions are independent of this setting.
+
+
+Q:
+
+› Got it, thanks.
+
+
+A:
+
+• You’re welcome.
+
+
+Q:
+
+› Check please, do I fixed this?
+
+
+A:
+
+• I’ll check the two test assertions and both README sections against the current DAG.
+
+• Yes, the stale parameter names are fixed. Both test assertions and both READMEs now use `ml_package_version`. All 10 `gyml_online_train` tests passed.
+
+One documentation detail remains. The ML README still uses `v3.1.0-dev` in the prerequisite S3 path and both examples, while the DAG pins `v3.2.0-dev`. I’d update all three occurrences to match the DAG. [ML README](/workspace/data/ml/README.md:252) · [DAG source](/workspace/data/airflow/dags/batch/gyml/gyml_online_train.py:42)
+
+
+Q:
+
+› No need to keep this snippet in doc and dag code in sync. As long as there no structural difference. Documentation is more abstract than code, by nature
+
+
+A:
+
+• Agreed. The README uses `v3.1.0-dev` as an example and correctly shows a single `ml_package_version` for both stages. The original finding is resolved, and all 10 DAG tests passed.
+
+
+Q:
+
+› Should we update mr-description skill?
+
+
+A:
+
+• I’ll check the GitLab MR description skill to see whether it already distinguishes illustrative values from documented defaults.
+
+• Yes. I’d add one sentence to the verification guidance in the [GitLab MR description skill](/home/dev/.codex/skills/gitlab-mr-description/SKILL.md):
+
+> When checking documentation against code, verify that examples use the current parameter names and show how the parameters work. Check literal values when the documentation presents them as defaults, requirements, or current deployment settings.
+
+That would catch the old parameter names while allowing an illustrative version like `v3.1.0-dev`.
+
+
+Q:
+
+› Agree. And what about 'markdown' requirement?
+
+
+A:
+
+• The skill already asks for Markdown, but I’d make the copy/paste requirement explicit:
+
+> Put each MR description variant in its own fenced `markdown` code block so the user can copy the raw Markdown directly into GitLab. Keep variant labels outside the blocks. If the user requests one variant, return just that block.
+
+That keeps the GitLab-ready text separate from the labels used to present it in chat.
+
+
+Q:
+
+› Great, update the skill, please
+
+
+A:
+
+• I’ll use the skill-creator guidance to update the GitLab MR description skill with both agreed rules.
+
+• Updated and validated the [GitLab MR description skill](/home/dev/.codex/skills/gitlab-mr-description/SKILL.md).
+
+- Verify that examples use current parameter names and show how the parameters work. Check exact values when they’re documented as defaults, requirements, or current deployment settings.
+- Return each MR variant in its own fenced `markdown` block for direct copy/paste into GitLab. If one variant is requested, return just that block.
+
+
+Q:
+
+› Export today’s session, please
+
+
+A:
+
+• I’ll use the export-session-dialog skill to save today’s conversation as a Q/A Markdown file, with tool logs omitted.
